@@ -14,7 +14,7 @@ const MAX_DNS_SUFFIX_STRING_LENGTH: usize = 256;
 pub const IP_ADAPTER_IPV4_ENABLED: DWORD = 0x0080;
 pub const IP_ADAPTER_IPV6_ENABLED: DWORD = 0x0100;
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::{io, mem, ptr};
 
 use winapi::shared::winerror::{
@@ -264,7 +264,12 @@ unsafe fn v6_socket_from_adapter(unicast_addr: &IpAdapterUnicastAddress) -> Sock
     let sock_addr6: *const SOCKADDR_IN6 = socket_addr.lpSockaddr as *const SOCKADDR_IN6;
     let in6_addr: SOCKADDR_IN6 = *sock_addr6;
 
-    let v6_addr = (*in6_addr.sin6_addr.u.Word()).into();
+    // `Word()` reinterprets the on-wire (network order) bytes as `[u16; 8]`, so on a
+    // little-endian host every group is read byte-swapped and `Ipv6Addr::from` then takes
+    // those swapped values as address segments. `Byte()` keeps the on-wire order, which is
+    // what `Ipv6Addr::from::<[u8; 16]>` expects - the same reasoning the IPv4 path above
+    // already applies to `S_addr`.
+    let v6_addr = Ipv6Addr::from(*in6_addr.sin6_addr.u.Byte());
 
     SocketAddrV6::new(
         v6_addr,

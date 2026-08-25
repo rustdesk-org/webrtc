@@ -6,12 +6,39 @@ use tokio::time::Duration;
 
 use crate::association::RtxTimerId;
 
-pub(crate) const RTO_INITIAL: u64 = 3000; // msec
-pub(crate) const RTO_MIN: u64 = 1000; // msec
+// RFC 4960's RTO.Initial/RTO.Min are 3000/1000, inherited from TCP for arbitrary public paths.
+// They cost a full second per loss here, and fast retransmit cannot cover for it: a
+// request/response exchange keeps one chunk in flight, so no later SACK ever raises
+// `miss_indicator` to the 3 that arms it, leaving the T3 floor as the recovery time.
+//
+// The values below are dcsctp's, the SCTP implementation Google wrote to replace usrsctp for
+// Chrome's WebRTC data channels - the same realtime workload - from
+// https://webrtc.googlesource.com/src/+/refs/heads/main/net/dcsctp/public/dcsctp_options.h
+//
+//     rto_initial = 500      rto_min = 400      rto_max = 60'000
+//
+// `rto_min` carries dcsctp's comment "This must be larger than an expected peer delayed ack
+// timeout". The longest a peer may take to acknowledge a DATA chunk is RTT + ATO, and 200ms is
+// the delayed-ack default both in usrsctp and in this crate (`ACK_INTERVAL`). A floor at or below
+// the peer's ATO makes T3 fire before the acknowledgement can physically arrive, so every idle
+// single-chunk exchange retransmits - and an SCTP T3 also collapses cwnd to one MTU and halves
+// ssthresh, which costs far more than the duplicate packet.
+//
+// Lowering our own `ACK_INTERVAL` would not help: the budget an RTO must cover is the *peer's*
+// delayed-ack timer, which we do not control at all when the peer is a browser.
+pub(crate) const RTO_INITIAL: u64 = 500; // msec
+pub(crate) const RTO_MIN: u64 = 400; // msec
 pub(crate) const RTO_MAX: u64 = 60000; // msec
 pub(crate) const RTO_ALPHA: u64 = 1;
 pub(crate) const RTO_BETA: u64 = 2;
 pub(crate) const RTO_BASE: u64 = 8;
+// dcsctp's `min_rtt_variance`, which it identifies as the "G" (clock granularity) term of
+// https://datatracker.ietf.org/doc/html/rfc6298#section-4. RTO_MIN alone only protects links
+// whose RTT is small enough for the floor to bind: at 300ms RTT `srtt + 4*rttvar` already
+// exceeds 400 while the peer may still need 300 + 200 = 500ms to acknowledge. Flooring the
+// variance keeps the ATO budget inside the formula at every RTT. 220 is dcsctp's number - the
+// 200ms ATO plus a 10% margin for the peer's packet processing and timer granularity.
+pub(crate) const RTT_VAR_MIN: f64 = 220.0; // msec
 pub(crate) const MAX_INIT_RETRANS: usize = 8;
 pub(crate) const PATH_MAX_RETRANS: usize = 5;
 pub(crate) const NO_MAX_RETRANS: usize = 0;
@@ -53,6 +80,9 @@ impl RtoManager {
             self.srtt = ((RTO_BASE - RTO_ALPHA) * self.srtt + RTO_ALPHA * rtt) / RTO_BASE;
         }
 
+        if self.rttvar < RTT_VAR_MIN {
+            self.rttvar = RTT_VAR_MIN;
+        }
         self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(RTO_MIN, RTO_MAX);
 
         self.srtt

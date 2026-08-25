@@ -94,7 +94,9 @@ mod test_rto_manager {
     #[tokio::test]
     async fn test_rto_manager_rto_calculation_small_rtt() -> Result<()> {
         let mut m = RtoManager::new();
-        let exp = [1800, 1500, 1275, 1106, 1000];
+        // With RTT_VAR_MIN the variance stops decaying at 220, so RTO settles at
+        // srtt + 4*220 = 1480 instead of drifting down into the old RTO_MIN.
+        let exp = [1800, 1500, 1480, 1480, 1480];
 
         for i in 0..5 {
             m.set_new_rtt(600);

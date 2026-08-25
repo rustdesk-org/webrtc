@@ -53,7 +53,11 @@ use crate::util::*;
 
 pub(crate) const RECEIVE_MTU: usize = 8192;
 /// MTU for inbound packet (from DTLS)
-pub(crate) const INITIAL_MTU: u32 = 1228;
+// 1228 does not survive an IPv6 path: +37 DTLS record (13 header, 8 explicit nonce, 16 GCM tag)
+// +8 UDP +40 IPv6 is 1313, past the 1280 minimum MTU, so every full-size chunk fragments. 1191
+// leaves the same stack at 1276. dcsctp lands on the same number: its `kMaxSafeMTUSize` is
+// documented as the 1280 IPv6 MTU minus 89 bytes of protocol overhead.
+pub(crate) const INITIAL_MTU: u32 = 1191;
 /// initial MTU for outgoing packets (to DTLS)
 pub(crate) const INITIAL_RECV_BUF_SIZE: u32 = 1024 * 1024;
 pub(crate) const COMMON_HEADER_SIZE: u32 = 12;

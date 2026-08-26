@@ -26,6 +26,15 @@ use crate::association::RtxTimerId;
 //
 // Lowering our own `ACK_INTERVAL` would not help: the budget an RTO must cover is the *peer's*
 // delayed-ack timer, which we do not control at all when the peer is a browser.
+//
+// One deliberate divergence: dcsctp gives its control timers their own initial value, while this
+// crate drives T1-init, T1-cookie, T2-shutdown and T3 from the one RtoManager, so RTO_INITIAL
+// moves all of them. It has to: `set_new_rtt` is only reached from SACK handling, so the
+// INIT/COOKIE exchange never produces an RTT sample and RTO_INITIAL *is* the T3 value for the
+// first DATA chunk - the login exchange and the first keyframe, which is the whole point here.
+// The control timers therefore retransmit sooner than dcsctp's would. That is accepted: the
+// deadline a user actually experiences comes from the application's own connect timeout, which
+// fires long before the association exhausts its retransmission budget.
 pub(crate) const RTO_INITIAL: u64 = 500; // msec
 pub(crate) const RTO_MIN: u64 = 400; // msec
 pub(crate) const RTO_MAX: u64 = 60000; // msec

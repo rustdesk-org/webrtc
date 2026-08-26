@@ -33,12 +33,17 @@ pub(crate) const RTO_ALPHA: u64 = 1;
 pub(crate) const RTO_BETA: u64 = 2;
 pub(crate) const RTO_BASE: u64 = 8;
 // dcsctp's `min_rtt_variance`, which it identifies as the "G" (clock granularity) term of
-// https://datatracker.ietf.org/doc/html/rfc6298#section-4. RTO_MIN alone only protects links
-// whose RTT is small enough for the floor to bind: at 300ms RTT `srtt + 4*rttvar` already
-// exceeds 400 while the peer may still need 300 + 200 = 500ms to acknowledge. Flooring the
-// variance keeps the ATO budget inside the formula at every RTT. 220 is dcsctp's number - the
-// 200ms ATO plus a 10% margin for the peer's packet processing and timer granularity.
-pub(crate) const RTT_VAR_MIN: f64 = 220.0; // msec
+// https://datatracker.ietf.org/doc/html/rfc6298#section-4: a floor under the measured variance
+// so a quiet link cannot let RTO converge onto SRTT and start timing out before an
+// acknowledgement can physically arrive.
+//
+// dcsctp configures 220 but does NOT use it raw. RetransmissionTimeout divides it by
+// `kHeuristicVarianceAdjustment = 8.0` first, with the comment that the /8 was originally
+// unintentional (the code used scaled integers) and was kept because downstream users had
+// measured good values with it. The effective floor is therefore 220/8 = 27.5ms of variance,
+// contributing 4 * 27.5 = 110ms to RTO - not 220ms, and emphatically not 880ms. Flooring the
+// raw variance at 220 would add ~770ms to every RTO and undo the point of the change.
+pub(crate) const RTT_VAR_MIN: f64 = 220.0 / 8.0; // msec, dcsctp's 220 after its /8 adjustment
 pub(crate) const MAX_INIT_RETRANS: usize = 8;
 pub(crate) const PATH_MAX_RETRANS: usize = 5;
 pub(crate) const NO_MAX_RETRANS: usize = 0;

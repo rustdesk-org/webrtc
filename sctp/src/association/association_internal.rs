@@ -1936,7 +1936,9 @@ impl AssociationInternal {
                 continue;
             }
 
-            if self.inflight_queue.get_num_bytes() + data_len > self.cwnd as usize {
+            if !no_congestion_control()
+                && self.inflight_queue.get_num_bytes() + data_len > self.cwnd as usize
+            {
                 break; // would exceed cwnd
             }
 
@@ -2056,7 +2058,11 @@ impl AssociationInternal {
     /// get_data_packets_to_retransmit is called when T3-rtx is timed out and retransmit outstanding data chunks
     /// that are not acked or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self) -> Vec<Packet> {
-        let awnd = std::cmp::min(self.cwnd, self.rwnd);
+        let awnd = if no_congestion_control() {
+            self.rwnd
+        } else {
+            std::cmp::min(self.cwnd, self.rwnd)
+        };
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
         let mut done = false;

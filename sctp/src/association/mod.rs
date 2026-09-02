@@ -67,6 +67,30 @@ pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;
 /// other constants
 pub(crate) const ACCEPT_CH_SIZE: usize = 16;
 
+// RFC 4960's AIMD halves cwnd on every fast retransmit and drops it to one MTU on a T3, and slow
+// start only rebuilds it while data is queued behind it. Where loss is not congestion - random
+// loss on a long-haul link - that pins the send rate to the Mathis ceiling MSS/(RTT*sqrt(p))
+// however idle the link is: about 1.3 Mbps at 70ms RTT and 1% loss, under a 1080p stream. KCP's
+// turbo profile (nc=1) runs with no congestion window at all, and this is its equivalent.
+//
+// Sender-side only: nothing is negotiated, any peer interoperates. In-flight data stays bounded
+// by the peer's rwnd (INITIAL_RECV_BUF_SIZE by default, 1 MiB), close to KCP's 1024-segment
+// window. cwnd and ssthresh go on being maintained, so fast recovery and the trace logs read as
+// before; only the two places that gate sending on cwnd consult this.
+//
+// Process-wide rather than a `Config` field: `Config` is built inside the webrtc crate, out of
+// any caller's reach.
+static NO_CONGESTION_CONTROL: AtomicBool = AtomicBool::new(false);
+
+/// Send whatever the peer's rwnd admits, ignoring cwnd.
+pub fn set_no_congestion_control(on: bool) {
+    NO_CONGESTION_CONTROL.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn no_congestion_control() -> bool {
+    NO_CONGESTION_CONTROL.load(Ordering::Relaxed)
+}
+
 /// association state enums
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum AssociationState {

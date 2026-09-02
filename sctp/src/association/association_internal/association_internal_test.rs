@@ -571,3 +571,319 @@ async fn test_assoc_max_message_size_explicit() -> Result<()> {
 
     Ok(())
 }
+
+fn create_client_association_internal() -> AssociationInternal {
+    create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+    })
+}
+
+/// Queues `n` single-chunk messages of `size` bytes and returns how many bytes one pass of
+/// the pending-queue pop sends.
+async fn queue_and_pop(a: &mut AssociationInternal, n: usize, size: usize) -> usize {
+    for i in 0..n {
+        a.pending_queue
+            .push(ChunkPayloadData {
+                beginning_fragment: true,
+                ending_fragment: true,
+                stream_identifier: 1,
+                stream_sequence_number: i as u16,
+                user_data: Bytes::from(vec![0u8; size]),
+                ..Default::default()
+            })
+            .await;
+    }
+    let (chunks, _) = a.pop_pending_data_chunks_to_send().await;
+    chunks.iter().map(|c| c.user_data.len()).sum()
+}
+
+#[tokio::test]
+async fn test_assoc_no_congestion_control_sends_past_cwnd_up_to_rwnd() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.rwnd = 20_000;
+    assert!(a.cwnd < a.rwnd);
+
+    let sent = queue_and_pop(&mut a, 40, 1000).await;
+
+    assert!(sent > a.cwnd as usize, "cwnd should not gate sending");
+    assert_eq!(sent, 20_000, "rwnd should still gate sending");
+
+    Ok(())
+}
+
+// The switch is the association's own copy, not the process-wide static: `a` keeps sending
+// without cwnd after the static is set off. (Only ever set off here, its default, so the
+// tests creating associations in parallel are not affected.)
+#[tokio::test]
+async fn test_assoc_no_congestion_control_fixed_at_creation() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    set_no_congestion_control(false);
+    let mut b = create_client_association_internal();
+    a.rwnd = 20_000;
+    b.rwnd = 20_000;
+
+    let sent_a = queue_and_pop(&mut a, 40, 1000).await;
+    let sent_b = queue_and_pop(&mut b, 40, 1000).await;
+
+    assert_eq!(sent_a, 20_000, "created with the switch on: rwnd alone");
+    assert!(
+        sent_b <= b.cwnd as usize,
+        "created with it off: cwnd applies"
+    );
+
+    Ok(())
+}
+
+/// T3-rtx with the peer's window fully used: RFC 4960 sec 6.2.1 gives the marked chunks
+/// their rwnd credit back, so every one of them is resent, not just a zero-window probe.
+async fn assert_t3_resends_all_marked(nocc: bool) {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = nocc;
+    a.cumulative_tsn_ack_point = 9;
+    a.rwnd = 0;
+    for tsn in 10..=12 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn,
+            stream_identifier: 1,
+            stream_sequence_number: (tsn - 10) as u16,
+            user_data: Bytes::from(vec![0u8; 100]),
+            nsent: 1,
+            retransmit: true,
+            ..Default::default()
+        });
+    }
+
+    let packets = a.get_data_packets_to_retransmit();
+
+    let resent: usize = packets.iter().map(|p| p.chunks.len()).sum();
+    assert_eq!(
+        resent, 3,
+        "nocc={nocc}: every marked chunk should be resent"
+    );
+}
+
+#[tokio::test]
+async fn test_assoc_t3_resends_all_marked_with_rwnd_exhausted() -> Result<()> {
+    assert_t3_resends_all_marked(false).await;
+    assert_t3_resends_all_marked(true).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_assoc_no_congestion_control_caps_inflight_below_large_rwnd() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.rwnd = 4 * NO_CC_MAX_INFLIGHT as u32;
+
+    let sent = queue_and_pop(&mut a, 2048, 1024).await;
+
+    assert_eq!(
+        sent, NO_CC_MAX_INFLIGHT,
+        "a large a_rwnd must not enlarge the burst"
+    );
+
+    Ok(())
+}
+
+/// Puts TSN 10..=16 in flight with 100-byte chunks sent in TSN order, `sent_seq` == TSN.
+fn inflight_10_to_16(a: &mut AssociationInternal) {
+    a.cumulative_tsn_ack_point = 9;
+    a.my_next_tsn = 17;
+    a.send_seq = 17;
+    for tsn in 10..=16 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            tsn,
+            user_data: Bytes::from(vec![0u8; 100]),
+            nsent: 1,
+            sent_seq: u64::from(tsn),
+            ..Default::default()
+        });
+    }
+}
+
+fn miss_indicator(a: &AssociationInternal, tsn: u32) -> Option<u32> {
+    a.inflight_queue.get(tsn).map(|c| c.miss_indicator)
+}
+
+/// Runs a SACK through the acking and loss-detection steps of handle_sack; `gaps` are offsets
+/// from `cum`, as on the wire.
+async fn sack(
+    a: &mut AssociationInternal,
+    cum: u32,
+    gaps: &[(u16, u16)],
+) -> crate::error::Result<()> {
+    use crate::chunk::chunk_selective_ack::GapAckBlock;
+    let d = ChunkSelectiveAck {
+        cumulative_tsn_ack: cum,
+        advertised_receiver_window_credit: a.rwnd,
+        gap_ack_blocks: gaps
+            .iter()
+            .map(|&(start, end)| GapAckBlock { start, end })
+            .collect(),
+        duplicate_tsn: vec![],
+    };
+    let (_, htna) = a.process_selective_ack(&d).await?;
+    let advanced = sna32lt(a.cumulative_tsn_ack_point, cum);
+    a.cumulative_tsn_ack_point = cum;
+    a.process_fast_retransmission(cum, htna, advanced)
+}
+
+// Only chunks sent after a chunk's latest transmission count as evidence against it: TSN 10
+// was resent after 11 and 12 went out, so their acks say nothing about the resend.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_detects_a_lost_retransmission() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_16(&mut a);
+    // 10 went out again between the first sends of 12 and 13.
+    for tsn in 13..=16 {
+        if let Some(c) = a.inflight_queue.get_mut(tsn) {
+            c.sent_seq += 1;
+        }
+    }
+    if let Some(c) = a.inflight_queue.get_mut(10) {
+        c.nsent = 2;
+        c.sent_seq = 13;
+    }
+    a.send_seq = 18;
+
+    sack(&mut a, 9, &[(2, 3), (5, 6)]).await?;
+    assert_eq!(
+        miss_indicator(&a, 10),
+        Some(2),
+        "acks below the resend must not count"
+    );
+    assert!(!a.will_retransmit_fast, "two acks above are not enough");
+
+    sack(&mut a, 9, &[(2, 3), (5, 7)]).await?;
+    assert_eq!(
+        miss_indicator(&a, 10),
+        Some(3),
+        "third ack above the resend"
+    );
+    assert!(a.will_retransmit_fast, "the lost resend must go out again");
+
+    Ok(())
+}
+
+// Chunks resent in one pass are evidence for each other: 10..=13 go out again together, and
+// the acks of 11..=13 alone show that 10's resend is lost, with no new data after them.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_resent_chunks_are_evidence_for_each_other() -> Result<()>
+{
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_16(&mut a);
+    for tsn in 10..=13 {
+        if let Some(c) = a.inflight_queue.get_mut(tsn) {
+            c.miss_indicator = 3;
+        }
+    }
+    for tsn in 14..=16 {
+        a.inflight_queue.mark_as_acked(tsn);
+    }
+    a.will_retransmit_fast = true;
+    let packets = a.gather_outbound_fast_retransmission_packets(vec![]);
+    let resent: usize = packets.iter().map(|p| p.chunks.len()).sum();
+    assert_eq!(resent, 4, "10..=13 resent together");
+
+    sack(&mut a, 9, &[(2, 7)]).await?;
+    assert_eq!(
+        miss_indicator(&a, 10),
+        Some(3),
+        "resent with 10, acked after it"
+    );
+    assert!(a.will_retransmit_fast, "10's resend is lost");
+
+    Ok(())
+}
+
+// Evidence is what was sent after the chunk's latest transmission, in any TSN direction: the
+// later resends of 10..=12 arriving show that 15's resend is lost, even though their acks come
+// as a cumulative point advance that takes them out of the in-flight queue.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_later_resends_of_lower_tsns_are_evidence() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_16(&mut a);
+    for tsn in [13, 14, 16] {
+        a.inflight_queue.mark_as_acked(tsn);
+    }
+    if let Some(c) = a.inflight_queue.get_mut(15) {
+        c.nsent = 2;
+        c.sent_seq = 17;
+    }
+    for tsn in 10..=12 {
+        if let Some(c) = a.inflight_queue.get_mut(tsn) {
+            c.nsent = 2;
+            c.sent_seq = 8 + u64::from(tsn);
+        }
+    }
+    a.send_seq = 21;
+
+    sack(&mut a, 14, &[(2, 2)]).await?;
+    assert_eq!(a.inflight_queue.len(), 2, "10..=14 left the queue");
+    assert_eq!(miss_indicator(&a, 15), Some(3), "three later sends acked");
+    assert!(a.will_retransmit_fast, "15's resend is lost");
+
+    Ok(())
+}
+
+/// Marks TSN 10..=14 lost and returns how many chunks one fast-retransmission pass sends.
+async fn fast_retransmitted(nocc: bool) -> usize {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = nocc;
+    a.cumulative_tsn_ack_point = 9;
+    for tsn in 10..=14 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            tsn,
+            user_data: Bytes::from(vec![0u8; 1000]),
+            nsent: 1,
+            miss_indicator: 3,
+            ..Default::default()
+        });
+    }
+    a.will_retransmit_fast = true;
+
+    let packets = a.gather_outbound_fast_retransmission_packets(vec![]);
+    packets.iter().map(|p| p.chunks.len()).sum()
+}
+
+#[tokio::test]
+async fn test_assoc_no_congestion_control_fast_retransmits_all_lost_chunks() -> Result<()> {
+    assert_eq!(
+        fast_retransmitted(false).await,
+        1,
+        "one MTU per SACK with cwnd"
+    );
+    assert_eq!(
+        fast_retransmitted(true).await,
+        5,
+        "everything found lost without cwnd"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_assoc_no_congestion_control_caps_inflight_chunks() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.rwnd = NO_CC_MAX_INFLIGHT as u32;
+
+    let sent = queue_and_pop(&mut a, 2 * NO_CC_MAX_INFLIGHT_CHUNKS, 10).await;
+
+    assert_eq!(
+        sent,
+        10 * NO_CC_MAX_INFLIGHT_CHUNKS,
+        "small chunks are bounded by count, as KCP's segments are"
+    );
+
+    Ok(())
+}

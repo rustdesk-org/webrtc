@@ -173,6 +173,14 @@ impl PayloadQueue {
         self.n_bytes
     }
 
+    pub(crate) fn get_num_bytes_to_retransmit(&self) -> usize {
+        self.chunk_map
+            .values()
+            .filter(|c| c.retransmit && !c.acked && !c.abandoned())
+            .map(|c| c.user_data.len())
+            .sum()
+    }
+
     pub(crate) fn len(&self) -> usize {
         assert_eq!(self.chunk_map.len(), self.length.load(Ordering::SeqCst));
         self.chunk_map.len()

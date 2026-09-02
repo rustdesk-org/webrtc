@@ -113,6 +113,9 @@ pub struct ChunkPayloadData {
     pub(crate) since: SystemTime,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
+    /// Place of this chunk's latest transmission in the association's send order; an ack for
+    /// anything sent from there on is evidence that transmission is lost.
+    pub(crate) sent_seq: u64,
 
     /// valid only with the first fragment
     pub(crate) abandoned: Arc<AtomicBool>,
@@ -140,6 +143,7 @@ impl Default for ChunkPayloadData {
             miss_indicator: 0,
             since: SystemTime::now(),
             nsent: 0,
+            sent_seq: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
@@ -219,6 +223,7 @@ impl Chunk for ChunkPayloadData {
             miss_indicator: 0,
             since: SystemTime::now(),
             nsent: 0,
+            sent_seq: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,

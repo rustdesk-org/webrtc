@@ -59,6 +59,11 @@ pub struct AssociationInternal {
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
+    pub(crate) no_congestion_control: bool,
+    /// Send-order stamp for the next DATA chunk transmission
+    pub(crate) send_seq: u64,
+    /// Stamps of the chunks the SACK being handled newly acked, evidence for the loss detection
+    pub(crate) sacked_seqs: Vec<u64>,
 
     // RTX & Ack timer
     pub(crate) rto_mgr: RtoManager,
@@ -170,6 +175,9 @@ impl AssociationInternal {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
+            no_congestion_control: no_congestion_control(),
+            send_seq: 0,
+            sacked_seqs: vec![],
 
             rto_mgr: RtoManager::new(),
             t1init: None,
@@ -449,12 +457,14 @@ impl AssociationInternal {
 
             let mut to_fast_retrans: Vec<Box<dyn Chunk + Send + Sync>> = vec![];
             let mut fast_retrans_size = COMMON_HEADER_SIZE;
+            let nocc = self.no_congestion_control;
+            let mut full_packets: Vec<Vec<Box<dyn Chunk + Send + Sync>>> = vec![];
 
             let mut i = 0;
             loop {
                 let tsn = self.cumulative_tsn_ack_point + i + 1;
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if c.acked || c.abandoned() || c.nsent > 1 || c.miss_indicator < 3 {
+                    if c.acked || c.abandoned() || (c.nsent > 1 && !nocc) || c.miss_indicator < 3 {
                         i += 1;
                         continue;
                     }
@@ -471,12 +481,23 @@ impl AssociationInternal {
 
                     let data_chunk_size = DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
                     if self.mtu < fast_retrans_size + data_chunk_size {
-                        break;
+                        if !nocc || to_fast_retrans.is_empty() {
+                            break;
+                        }
+                        // With no cwnd to protect, the rest of the lost chunks go out in
+                        // further packets now instead of one packet per round trip.
+                        full_packets.push(std::mem::take(&mut to_fast_retrans));
+                        fast_retrans_size = COMMON_HEADER_SIZE;
                     }
 
                     fast_retrans_size += data_chunk_size;
                     self.stats.inc_fast_retrans();
                     c.nsent += 1;
+                    if nocc {
+                        c.sent_seq = self.send_seq;
+                        self.send_seq += 1;
+                        c.miss_indicator = 0;
+                    }
                 } else {
                     break; // end of pending data
                 }
@@ -495,6 +516,10 @@ impl AssociationInternal {
                 i += 1;
             }
 
+            for chunks in full_packets {
+                let p = self.create_packet(chunks);
+                raw_packets.push(p);
+            }
             if !to_fast_retrans.is_empty() {
                 let p = self.create_packet(to_fast_retrans);
                 raw_packets.push(p);
@@ -1115,6 +1140,9 @@ impl AssociationInternal {
         while sna32lte(i, d.cumulative_tsn_ack) {
             if let Some(c) = self.inflight_queue.pop(i) {
                 if !c.acked {
+                    if self.no_congestion_control {
+                        self.sacked_seqs.push(c.sent_seq);
+                    }
                     // RFC 4096 sec 6.3.2.  Retransmission Timer Rules
                     //   R3)  Whenever a SACK is received that acknowledges the DATA chunk
                     //        with the earliest outstanding TSN for that address, restart the
@@ -1193,6 +1221,9 @@ impl AssociationInternal {
 
                 if let Some(c) = self.inflight_queue.get(tsn) {
                     if !is_acked {
+                        if self.no_congestion_control {
+                            self.sacked_seqs.push(c.sent_seq);
+                        }
                         // Sum the number of bytes acknowledged per stream
                         if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
                             *amount += n_bytes_acked;
@@ -1328,6 +1359,10 @@ impl AssociationInternal {
         // b)  In fast-recovery AND the Cumulative TSN Ack Point advanced
         //     the miss indications are incremented for all TSNs reported missing
         //     in the SACK.
+        if self.no_congestion_control {
+            return self.process_fast_retransmission_nocc(cum_tsn_ack_point);
+        }
+
         if !self.in_fast_recovery || cum_tsn_ack_point_advanced {
             let max_tsn = if !self.in_fast_recovery {
                 // a) increment only for missing TSNs prior to the HTNA
@@ -1374,6 +1409,44 @@ impl AssociationInternal {
             self.will_retransmit_fast = true;
         }
 
+        Ok(())
+    }
+
+    /// Loss detection when nothing waits on cwnd: a chunk is lost once three chunks sent after
+    /// its latest transmission have been acked. That is RFC 6675's DupThresh counted in send
+    /// order rather than TSN order, so it applies to retransmissions as well, chunks resent
+    /// together are evidence for each other, and so is the later resend of a lower TSN, whether
+    /// the SACK acks it in a gap block or by moving the cumulative point past it. It is not
+    /// suspended during fast recovery: with no cwnd to protect, a lost retransmission is found
+    /// by the next acks rather than by T3-rtx. A SACK does not say which transmission of a chunk
+    /// arrived, so an old copy delivered late counts as its resend would: a false miss
+    /// indication, and possibly a spurious retransmission.
+    fn process_fast_retransmission_nocc(&mut self, cum_tsn_ack_point: u32) -> Result<()> {
+        self.sacked_seqs.sort_unstable();
+        let mut fire = false;
+        for i in 0..self.inflight_queue.len() {
+            if let Some(c) = self
+                .inflight_queue
+                .get_mut(cum_tsn_ack_point + 1 + i as u32)
+            {
+                if c.acked || c.abandoned() || c.miss_indicator >= 3 {
+                    continue;
+                }
+                let sent_after =
+                    self.sacked_seqs.len() - self.sacked_seqs.partition_point(|&s| s < c.sent_seq);
+                c.miss_indicator = (c.miss_indicator + sent_after as u32).min(3);
+                if c.miss_indicator == 3 {
+                    fire = true;
+                }
+            } else {
+                return Err(Error::ErrTsnRequestNotExist);
+            }
+        }
+        self.sacked_seqs.clear();
+        if fire {
+            self.will_retransmit_fast = true;
+            self.awake_write_loop();
+        }
         Ok(())
     }
 
@@ -1875,6 +1948,8 @@ impl AssociationInternal {
 
             c.since = SystemTime::now(); // use to calculate RTT and also for maxPacketLifeTime
             c.nsent = 1; // being sent for the first time
+            c.sent_seq = self.send_seq;
+            self.send_seq += 1;
 
             self.check_partial_reliability_status(&c);
 
@@ -1936,10 +2011,17 @@ impl AssociationInternal {
                 continue;
             }
 
-            if !no_congestion_control()
-                && self.inflight_queue.get_num_bytes() + data_len > self.cwnd as usize
+            let window = if self.no_congestion_control {
+                NO_CC_MAX_INFLIGHT
+            } else {
+                self.cwnd as usize
+            };
+            if self.inflight_queue.get_num_bytes() + data_len > window {
+                break; // would exceed the send window
+            }
+            if self.no_congestion_control && self.inflight_queue.len() >= NO_CC_MAX_INFLIGHT_CHUNKS
             {
-                break; // would exceed cwnd
+                break;
             }
 
             if data_len > self.rwnd as usize {
@@ -2058,15 +2140,22 @@ impl AssociationInternal {
     /// get_data_packets_to_retransmit is called when T3-rtx is timed out and retransmit outstanding data chunks
     /// that are not acked or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self) -> Vec<Packet> {
-        let awnd = if no_congestion_control() {
-            self.rwnd
+        // RFC 4960 sec 6.2.1 B) and C): a chunk marked for retransmission has its size
+        // credited back to rwnd until it is sent again. `self.rwnd` still has those chunks
+        // subtracted, and the next SACK recomputes it from a_rwnd and what is in flight, so
+        // add them back for this decision only.
+        let marked = self.inflight_queue.get_num_bytes_to_retransmit() as u32;
+        let rwnd = self.rwnd.saturating_add(marked);
+        let awnd = if self.no_congestion_control {
+            rwnd
         } else {
-            std::cmp::min(self.cwnd, self.rwnd)
+            std::cmp::min(self.cwnd, rwnd)
         };
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
         let mut done = false;
         let mut i = 0;
+        let nocc = self.no_congestion_control;
         while !done {
             let tsn = self.cumulative_tsn_ack_point + i + 1;
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
@@ -2075,7 +2164,7 @@ impl AssociationInternal {
                     continue;
                 }
 
-                if i == 0 && self.rwnd < c.user_data.len() as u32 {
+                if i == 0 && rwnd < c.user_data.len() as u32 {
                     // Send it as a zero window probe
                     done = true;
                 } else if bytes_to_send + c.user_data.len() > awnd as usize {
@@ -2088,6 +2177,11 @@ impl AssociationInternal {
                 bytes_to_send += c.user_data.len();
 
                 c.nsent += 1;
+                if nocc {
+                    c.sent_seq = self.send_seq;
+                    self.send_seq += 1;
+                    c.miss_indicator = 0;
+                }
             } else {
                 break; // end of pending data
             }
@@ -2287,6 +2381,13 @@ impl AckTimerObserver for AssociationInternal {
             self.ack_state
         );
         self.stats.inc_ack_timeouts();
+        // The timer task has ended, but `start()` takes the retained close handle for a timer
+        // still running and refuses to arm another; pion's timeout() marks the timer stopped
+        // before notifying. Without this, every other lone DATA chunk waits for the next
+        // packet or the sender's T3-rtx to be acked.
+        if let Some(ack_timer) = &mut self.ack_timer {
+            ack_timer.stop();
+        }
         self.ack_state = AckState::Immediate;
         self.awake_write_loop();
     }

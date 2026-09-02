@@ -2585,3 +2585,149 @@ async fn test_association_handle_packet_before_init() -> Result<()> {
 
     Ok(())
 }
+
+// Each lone DATA chunk must be acked by the delayed-ack timer, not by the next packet or
+// the sender's T3-rtx: the timer has to arm again after it has fired once.
+#[tokio::test]
+async fn test_assoc_delayed_ack_timer_rearms() -> Result<()> {
+    const SI: u16 = 6;
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::AlwaysDelay, 0)
+            .await?;
+    let (s0, _s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let a = a0.association_internal.lock().await;
+        let b = a1.association_internal.lock().await;
+        a.stats.reset();
+        b.stats.reset();
+    }
+
+    for i in 1..=3u32 {
+        s0.write_sctp(
+            &Bytes::from_static(b"lone"),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+        // Long enough for the 200ms delayed ack, short of the T3-rtx timeout.
+        let since = tokio::time::Instant::now();
+        while since.elapsed() < Duration::from_millis(350) {
+            br.tick().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let a = a0.association_internal.lock().await;
+        let b = a1.association_internal.lock().await;
+        assert_eq!(
+            b.stats.get_num_ack_timeouts(),
+            u64::from(i),
+            "ack timeout #{i}"
+        );
+        assert_eq!(
+            a.stats.get_num_sacks(),
+            u64::from(i),
+            "sack for lone chunk #{i}"
+        );
+        assert_eq!(a.stats.get_num_t3timeouts(), 0, "should be no retransmit");
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}
+
+/// Ticks the bridge until the client counts `n` fast retransmissions, well short of T3-rtx.
+async fn tick_until_fast_retrans(br: &Arc<Bridge>, a0: &Association, n: u64) {
+    for _ in 0..200 {
+        br.tick().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        if a0
+            .association_internal
+            .lock()
+            .await
+            .stats
+            .get_num_fast_retrans()
+            >= n
+        {
+            break;
+        }
+    }
+}
+
+// Without a congestion window a lost fast retransmission is fast-retransmitted again once
+// three chunks sent after it are acked, instead of waiting for T3-rtx.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_fast_retransmits_a_lost_retransmission() -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.stats.reset();
+    }
+
+    // TSN 1 is lost, then its fast retransmission is lost too.
+    br.drop_next_nwrites(0, 1);
+    for i in 0..4u32 {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+    for _ in 0..200 {
+        if br.len(0).await == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    br.drop_next_nwrites(0, 1);
+    tick_until_fast_retrans(&br, &a0, 1).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(
+            a.stats.get_num_fast_retrans(),
+            1,
+            "first fast retransmission"
+        );
+    }
+
+    for i in 4..7u32 {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+    tick_until_fast_retrans(&br, &a0, 2).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(
+            a.stats.get_num_fast_retrans(),
+            2,
+            "lost resend found by later acks"
+        );
+        assert_eq!(a.stats.get_num_t3timeouts(), 0, "not by T3-rtx");
+    }
+
+    br.process().await;
+    let mut buf = vec![0u8; 3000];
+    for i in 0..7 {
+        let (n, _) = s1.read_sctp(&mut buf).await?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i,
+            "unexpected received data"
+        );
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}

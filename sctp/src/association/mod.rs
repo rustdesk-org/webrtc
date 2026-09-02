@@ -60,6 +60,13 @@ pub(crate) const RECEIVE_MTU: usize = 8192;
 pub(crate) const INITIAL_MTU: u32 = 1191;
 /// initial MTU for outgoing packets (to DTLS)
 pub(crate) const INITIAL_RECV_BUF_SIZE: u32 = 1024 * 1024;
+/// Most data in flight without a congestion window, whatever the peer advertises: KCP's turbo
+/// profile keeps its own snd_wnd (1024 segments of up to 1176 bytes) next to the peer's window.
+pub(crate) const NO_CC_MAX_INFLIGHT: usize = 1024 * 1024;
+/// Most chunks in flight without a congestion window, KCP's 1024 segments: the byte bound binds
+/// first with MTU-sized chunks, this one with small ones, keeping the per-chunk bookkeeping and
+/// the per-SACK loss detection bounded too.
+pub(crate) const NO_CC_MAX_INFLIGHT_CHUNKS: usize = 1024;
 pub(crate) const COMMON_HEADER_SIZE: u32 = 12;
 pub(crate) const DATA_CHUNK_HEADER_SIZE: u32 = 16;
 pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;
@@ -74,15 +81,22 @@ pub(crate) const ACCEPT_CH_SIZE: usize = 16;
 // turbo profile (nc=1) runs with no congestion window at all, and this is its equivalent.
 //
 // Sender-side only: nothing is negotiated, any peer interoperates. In-flight data stays bounded
-// by the peer's rwnd (INITIAL_RECV_BUF_SIZE by default, 1 MiB), close to KCP's 1024-segment
-// window. cwnd and ssthresh go on being maintained, so fast recovery and the trace logs read as
-// before; only the two places that gate sending on cwnd consult this.
+// by the peer's rwnd and by NO_CC_MAX_INFLIGHT / NO_CC_MAX_INFLIGHT_CHUNKS; a RustDesk peer
+// advertises INITIAL_RECV_BUF_SIZE (1 MiB), so with one the byte bounds coincide. cwnd and
+// ssthresh go on being maintained, so the trace logs read as before, but nothing waits on them:
+// the two places that gate sending on cwnd skip it, and loss detection and fast retransmission
+// follow process_fast_retransmission_nocc and gather_outbound_fast_retransmission_packets'
+// no-cwnd rules, KCP-like, rather than RFC 4960's.
 //
 // Process-wide rather than a `Config` field: `Config` is built inside the webrtc crate, out of
-// any caller's reach.
+// any caller's reach. Each association copies the value as it is created, so a later change
+// leaves established associations as they are.
 static NO_CONGESTION_CONTROL: AtomicBool = AtomicBool::new(false);
 
-/// Send whatever the peer's rwnd admits, ignoring cwnd.
+/// Send without a congestion window: new data is bounded by the peer's rwnd and the local
+/// in-flight limits only, and loss is recovered the KCP way, by acks of later sends, rather
+/// than by RFC 4960's cwnd-driven rules. Applies to associations created after this call;
+/// those already established keep the setting they were created with.
 pub fn set_no_congestion_control(on: bool) {
     NO_CONGESTION_CONTROL.store(on, Ordering::Relaxed);
 }

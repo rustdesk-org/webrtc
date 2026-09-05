@@ -8,6 +8,7 @@ use super::*;
 use crate::param::param_forward_tsn_supported::ParamForwardTsnSupported;
 use crate::param::param_type::ParamType;
 use crate::param::param_unrecognized::ParamUnrecognized;
+use crate::util::get_padding_size;
 
 pub struct AssociationInternal {
     pub(crate) name: String,
@@ -163,7 +164,9 @@ impl AssociationInternal {
             pending_queue: Arc::new(PendingQueue::new()),
             control_queue: ControlQueue::new(),
             mtu,
-            max_payload_size: mtu - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE),
+            // Rounded down to a multiple of 4, as dcsctp does: the chunk is padded to that on
+            // the wire, and 1163 bytes of payload marshal to a 1192-byte packet, past the MTU.
+            max_payload_size: (mtu - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE)) & !3,
             cumulative_tsn_ack_point: tsn - 1,
             advanced_peer_tsn_ack_point: tsn - 1,
             use_forward_tsn: false,
@@ -464,7 +467,12 @@ impl AssociationInternal {
             loop {
                 let tsn = self.cumulative_tsn_ack_point + i + 1;
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if c.acked || c.abandoned() || (c.nsent > 1 && !nocc) || c.miss_indicator < 3 {
+                    if c.acked
+                        || c.abandoned()
+                        || (c.nsent > 1 && !nocc)
+                        || (nocc && c.nsent > NO_CC_FAST_RETRANS_LIMIT)
+                        || c.miss_indicator < 3
+                    {
                         i += 1;
                         continue;
                     }
@@ -479,7 +487,7 @@ impl AssociationInternal {
                     //      of cwnd and SHOULD NOT delay retransmission for this single
                     //		packet.
 
-                    let data_chunk_size = DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
+                    let data_chunk_size = Self::data_chunk_wire_size(c);
                     if self.mtu < fast_retrans_size + data_chunk_size {
                         if !nocc || to_fast_retrans.is_empty() {
                             break;
@@ -2056,6 +2064,14 @@ impl AssociationInternal {
         (chunks, sis_to_reset)
     }
 
+    /// What a DATA chunk adds to a packet: `Packet::marshal` pads every chunk to a 4-byte
+    /// boundary, so the bundlers must count that as well as the header, or a bundle of small
+    /// chunks lands past the MTU that INITIAL_MTU keeps an IPv6 packet under.
+    fn data_chunk_wire_size(c: &ChunkPayloadData) -> u32 {
+        let len = c.user_data.len();
+        DATA_CHUNK_HEADER_SIZE + (len + get_padding_size(len)) as u32
+    }
+
     /// bundle_data_chunks_into_packets packs DATA chunks into packets. It tries to bundle
     /// DATA chunks into a packet so long as the resulting packet size does not exceed
     /// the path MTU.
@@ -2070,13 +2086,14 @@ impl AssociationInternal {
             //   single packet.  Furthermore, DATA chunks being retransmitted MAY be
             //   bundled with new DATA chunks, as long as the resulting packet size
             //   does not exceed the path MTU.
-            if bytes_in_packet + c.user_data.len() as u32 > self.mtu {
+            let chunk_size = Self::data_chunk_wire_size(&c);
+            if bytes_in_packet + chunk_size > self.mtu {
                 packets.push(self.create_packet(chunks_to_send));
                 chunks_to_send = vec![];
                 bytes_in_packet = COMMON_HEADER_SIZE;
             }
 
-            bytes_in_packet += DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
+            bytes_in_packet += chunk_size;
             chunks_to_send.push(Box::new(c));
         }
 

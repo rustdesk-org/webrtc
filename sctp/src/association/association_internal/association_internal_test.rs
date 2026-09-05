@@ -887,3 +887,71 @@ async fn test_assoc_no_congestion_control_caps_inflight_chunks() -> Result<()> {
 
     Ok(())
 }
+
+// Both bundlers must count a chunk as it goes on the wire, header and 4-byte padding included.
+// Counting the payload alone let a bundle of small chunks marshal past the MTU: 500 + 663
+// payload bytes pass a payload-only check against 1191 exactly and marshal to 1208, and a run
+// of 1-byte chunks, each padded to 4, overshoots by a quarter.
+#[test]
+fn test_bundled_data_chunks_stay_within_mtu() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+    });
+    let chunk = |tsn: u32, len: usize| ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        stream_identifier: 1,
+        stream_sequence_number: tsn as u16,
+        user_data: Bytes::from(vec![0u8; len]),
+        nsent: 1,
+        ..Default::default()
+    };
+    let sizes: Vec<usize> = [500, 663]
+        .into_iter()
+        .chain(std::iter::repeat(1).take(100))
+        .collect();
+
+    let chunks: Vec<_> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| chunk(i as u32 + 1, len))
+        .collect();
+    let packets = a.bundle_data_chunks_into_packets(chunks);
+    assert!(packets.len() > 1, "the chunks should span several packets");
+    for p in packets {
+        let raw = p.marshal()?;
+        assert!(
+            raw.len() as u32 <= a.mtu,
+            "bundled packet of {} bytes exceeds the MTU of {}",
+            raw.len(),
+            a.mtu
+        );
+    }
+
+    // The fast-retransmit bundler, with every chunk found lost.
+    a.no_congestion_control = true;
+    a.cumulative_tsn_ack_point = 0;
+    for (i, &len) in sizes.iter().enumerate() {
+        let mut c = chunk(i as u32 + 1, len);
+        c.miss_indicator = 3;
+        a.inflight_queue.push_no_check(c);
+    }
+    a.will_retransmit_fast = true;
+    let packets = a.gather_outbound_fast_retransmission_packets(vec![]);
+    assert!(packets.len() > 1, "the resends should span several packets");
+    for p in packets {
+        let raw = p.marshal()?;
+        assert!(
+            raw.len() as u32 <= a.mtu,
+            "fast-retransmit packet of {} bytes exceeds the MTU of {}",
+            raw.len(),
+            a.mtu
+        );
+    }
+
+    Ok(())
+}

@@ -67,6 +67,11 @@ pub(crate) const NO_CC_MAX_INFLIGHT: usize = 1024 * 1024;
 /// first with MTU-sized chunks, this one with small ones, keeping the per-chunk bookkeeping and
 /// the per-SACK loss detection bounded too.
 pub(crate) const NO_CC_MAX_INFLIGHT_CHUNKS: usize = 1024;
+/// Most times a chunk is sent before its fast retransmission is left to T3-rtx without a
+/// congestion window, KCP's IKCP_FASTACK_LIMIT. The send-order rule cannot tell an old copy's
+/// late ack from its resend's, so a chunk whose acks keep arriving late would otherwise be resent
+/// for as long as chunks sent after it are acked.
+pub(crate) const NO_CC_FAST_RETRANS_LIMIT: u32 = 5;
 pub(crate) const COMMON_HEADER_SIZE: u32 = 12;
 pub(crate) const DATA_CHUNK_HEADER_SIZE: u32 = 16;
 pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;

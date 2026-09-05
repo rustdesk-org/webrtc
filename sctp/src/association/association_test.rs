@@ -2731,3 +2731,129 @@ async fn test_assoc_no_congestion_control_fast_retransmits_a_lost_retransmission
 
     Ok(())
 }
+
+async fn tick_until_t3rtx(br: &Arc<Bridge>, a0: &Association, n: u64) {
+    for _ in 0..3000 {
+        br.tick().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        if a0
+            .association_internal
+            .lock()
+            .await
+            .stats
+            .get_num_t3timeouts()
+            >= n
+        {
+            break;
+        }
+    }
+}
+
+// Without a congestion window a chunk is fast-retransmitted at most NO_CC_FAST_RETRANS_LIMIT
+// times; lost that often, it waits for T3-rtx, as KCP's IKCP_FASTACK_LIMIT has it. Otherwise a
+// chunk whose acks keep arriving late is resent for as long as chunks sent after it are acked.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_caps_fast_retransmissions() -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.stats.reset();
+    }
+
+    // TSN 1 is lost, and so is every fast retransmission of it. Each round writes three more
+    // chunks, whose acks are the evidence for the next resend.
+    let mut written = 0u32;
+    br.drop_next_nwrites(0, 1);
+    for _ in 0..4 {
+        sbuf[0..4].copy_from_slice(&written.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+        written += 1;
+    }
+    for round in 1..=NO_CC_FAST_RETRANS_LIMIT as u64 {
+        for _ in 0..200 {
+            if br.len(0).await == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(br.len(0).await, 3, "round {round}: three chunks queued");
+        br.drop_next_nwrites(0, 1);
+        tick_until_fast_retrans(&br, &a0, round).await;
+        {
+            let a = a0.association_internal.lock().await;
+            assert_eq!(
+                a.stats.get_num_fast_retrans(),
+                round,
+                "round {round}: fast retransmissions"
+            );
+            assert_eq!(a.stats.get_num_t3timeouts(), 0, "round {round}: no T3-rtx yet");
+        }
+        for _ in 0..3 {
+            sbuf[0..4].copy_from_slice(&written.to_be_bytes());
+            s0.write_sctp(
+                &Bytes::from(sbuf.clone()),
+                PayloadProtocolIdentifier::Binary,
+            )
+            .await?;
+            written += 1;
+        }
+    }
+
+    // TSN 1 has now been sent NO_CC_FAST_RETRANS_LIMIT + 1 times. This round's acks are the same
+    // evidence as before, and must not resend it; T3-rtx does.
+    for _ in 0..200 {
+        if br.len(0).await == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    for _ in 0..50 {
+        br.tick().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(
+            a.stats.get_num_fast_retrans(),
+            NO_CC_FAST_RETRANS_LIMIT as u64,
+            "no fast retransmission past the cap"
+        );
+        assert_eq!(a.stats.get_num_t3timeouts(), 0, "T3-rtx has not fired yet");
+    }
+    tick_until_t3rtx(&br, &a0, 1).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_t3timeouts(), 1, "recovered by T3-rtx");
+        assert_eq!(
+            a.stats.get_num_fast_retrans(),
+            NO_CC_FAST_RETRANS_LIMIT as u64,
+            "still no fast retransmission past the cap"
+        );
+    }
+
+    br.process().await;
+    let mut buf = vec![0u8; 3000];
+    for i in 0..written {
+        let (n, _) = s1.read_sctp(&mut buf).await?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i,
+            "unexpected received data"
+        );
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}

@@ -125,6 +125,7 @@ impl AssociationInternal {
         } else {
             config.max_receive_buffer_size
         };
+        let no_cc = no_congestion_control();
 
         let max_message_size = if config.max_message_size == 0 {
             DEFAULT_MAX_MESSAGE_SIZE
@@ -196,7 +197,7 @@ impl AssociationInternal {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
-            no_congestion_control: no_congestion_control(),
+            no_congestion_control: no_cc,
             send_seq: 0,
             sacked_sends: vec![],
             newest_acked_sent_at: None,
@@ -206,7 +207,11 @@ impl AssociationInternal {
             reo_wnd_seen_at: None,
             reo_wnd_dup_at: None,
 
-            rto_mgr: RtoManager::new(),
+            rto_mgr: if no_cc {
+                RtoManager::new_no_congestion_control()
+            } else {
+                RtoManager::new()
+            },
             t1init: None,
             t1cookie: None,
             t2shutdown: None,
@@ -654,7 +659,19 @@ impl AssociationInternal {
                 raw_packets = self
                     .gather_outbound_data_and_reconfig_packets(raw_packets)
                     .await;
+                let before = raw_packets.len();
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets);
+                if self.no_congestion_control && raw_packets.len() > before {
+                    // A fast retransmission restarts T3-rtx, as a KCP resend restarts the
+                    // segment's own timer. RFC 4960 leaves the timer running from the
+                    // earliest chunk's first send, and at RTO_MIN_NO_CC that is before the
+                    // resend can be acked: T3 would fire on a loss fast retransmit had already
+                    // recovered and resend everything in flight for nothing.
+                    if let Some(t3rtx) = &self.t3rtx {
+                        t3rtx.stop().await;
+                        t3rtx.start(self.rto_mgr.get_rto()).await;
+                    }
+                }
                 raw_packets = self.gather_outbound_sack_packets(raw_packets).await;
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 (raw_packets, true)
@@ -2050,6 +2067,11 @@ impl AssociationInternal {
             c.sent_seq = self.send_seq;
             c.sent_at = Instant::now();
             self.send_seq += 1;
+            // RFC 7053: ask for the SACK at once. With no congestion window the RTO floors are
+            // sized for a peer that answers within an RTT, not one holding a delayed ack for
+            // 200ms; and a SACK per packet is what the loss detection counts. Set on the copy
+            // kept for retransmission too, so a resend is acked the same way.
+            c.immediate_sack = self.no_congestion_control;
 
             self.check_partial_reliability_status(&c);
 

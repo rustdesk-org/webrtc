@@ -984,6 +984,35 @@ async fn test_assoc_no_congestion_control_widens_the_window_on_duplicates() -> R
     Ok(())
 }
 
+// Without a congestion window every chunk asks for its SACK at once (RFC 7053), on the wire and
+// on the copy kept for retransmission; with one, the peer's delayed ack is left alone.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_asks_for_immediate_sacks() -> Result<()> {
+    for nocc in [false, true] {
+        let mut a = create_client_association_internal();
+        a.no_congestion_control = nocc;
+        a.rwnd = 100_000;
+        a.cwnd = 100_000;
+        a.pending_queue
+            .push(ChunkPayloadData {
+                beginning_fragment: true,
+                ending_fragment: true,
+                user_data: Bytes::from(vec![0u8; 100]),
+                ..Default::default()
+            })
+            .await;
+        let (chunks, _) = a.pop_pending_data_chunks_to_send().await;
+        assert_eq!(chunks.len(), 1, "nocc={nocc}: one chunk to send");
+        assert_eq!(chunks[0].immediate_sack, nocc, "nocc={nocc}: on the wire");
+        assert_eq!(
+            a.inflight_queue.get(chunks[0].tsn).map(|c| c.immediate_sack),
+            Some(nocc),
+            "nocc={nocc}: on the in-flight copy"
+        );
+    }
+    Ok(())
+}
+
 // Both bundlers must count a chunk as it goes on the wire, header and 4-byte padding included.
 // Counting the payload alone let a bundle of small chunks marshal past the MTU: 500 + 663
 // payload bytes pass a payload-only check against 1191 exactly and marshal to 1208, and a run

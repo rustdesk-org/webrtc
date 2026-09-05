@@ -91,6 +91,28 @@ mod test_rto_manager {
         Ok(())
     }
 
+    // Without a congestion window the floors are KCP's: on a steady 70ms path RTO settles at
+    // srtt + 4 * 10ms, where dcsctp's floors would hold it at 400ms.
+    #[tokio::test]
+    async fn test_rto_manager_no_congestion_control_floors() -> Result<()> {
+        let mut m = RtoManager::new_no_congestion_control();
+        let mut d = RtoManager::new();
+        for _ in 0..8 {
+            m.set_new_rtt(70);
+            d.set_new_rtt(70);
+        }
+        assert_eq!(m.get_rto(), 110, "srtt + 4 * RTT_VAR_MIN_NO_CC");
+        assert_eq!(d.get_rto(), RTO_MIN, "dcsctp's floor binds");
+
+        let mut m = RtoManager::new_no_congestion_control();
+        for _ in 0..8 {
+            m.set_new_rtt(5);
+        }
+        assert_eq!(m.get_rto(), RTO_MIN_NO_CC, "the floor on a LAN");
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_rto_manager_rto_calculation_small_rtt() -> Result<()> {
         let mut m = RtoManager::new();

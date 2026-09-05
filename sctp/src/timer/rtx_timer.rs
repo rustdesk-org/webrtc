@@ -53,6 +53,14 @@ pub(crate) const RTO_BASE: u64 = 8;
 // contributing 4 * 27.5 = 110ms to RTO - not 220ms, and emphatically not 880ms. Flooring the
 // raw variance at 220 would add ~770ms to every RTO and undo the point of the change.
 pub(crate) const RTT_VAR_MIN: f64 = 220.0 / 8.0; // msec, dcsctp's 220 after its /8 adjustment
+// Without a congestion window every DATA chunk carries the I bit (RFC 7053), so a peer that
+// honours it answers within an RTT and the 200ms delayed-ack budget above no longer applies. A
+// chunk lost at the tail of a burst has nothing sent after it to ack, so its recovery time *is*
+// the RTO, and these floors are KCP's shape: its turbo profile floors RTO at 30ms and the
+// variance term at its 10ms tick, for about srtt + 40ms. 100ms keeps a margin over jitter on top
+// of that. A T3 here resends everything in flight, so the floors stay well clear of an RTT.
+pub(crate) const RTO_MIN_NO_CC: u64 = 100; // msec
+pub(crate) const RTT_VAR_MIN_NO_CC: f64 = 10.0; // msec
 pub(crate) const MAX_INIT_RETRANS: usize = 8;
 pub(crate) const PATH_MAX_RETRANS: usize = 5;
 pub(crate) const NO_MAX_RETRANS: usize = 0;
@@ -65,6 +73,8 @@ pub(crate) struct RtoManager {
     pub(crate) rttvar: f64,
     pub(crate) rto: u64,
     pub(crate) no_update: bool,
+    rto_min: u64,
+    rttvar_min: f64,
 }
 
 impl RtoManager {
@@ -72,6 +82,19 @@ impl RtoManager {
     pub(crate) fn new() -> Self {
         RtoManager {
             rto: RTO_INITIAL,
+            rto_min: RTO_MIN,
+            rttvar_min: RTT_VAR_MIN,
+            ..Default::default()
+        }
+    }
+
+    /// The manager for an association sending without a congestion window: RTO_MIN_NO_CC and
+    /// RTT_VAR_MIN_NO_CC in place of dcsctp's floors.
+    pub(crate) fn new_no_congestion_control() -> Self {
+        RtoManager {
+            rto: RTO_INITIAL,
+            rto_min: RTO_MIN_NO_CC,
+            rttvar_min: RTT_VAR_MIN_NO_CC,
             ..Default::default()
         }
     }
@@ -94,10 +117,10 @@ impl RtoManager {
             self.srtt = ((RTO_BASE - RTO_ALPHA) * self.srtt + RTO_ALPHA * rtt) / RTO_BASE;
         }
 
-        if self.rttvar < RTT_VAR_MIN {
-            self.rttvar = RTT_VAR_MIN;
+        if self.rttvar < self.rttvar_min {
+            self.rttvar = self.rttvar_min;
         }
-        self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(RTO_MIN, RTO_MAX);
+        self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(self.rto_min, RTO_MAX);
 
         self.srtt
     }

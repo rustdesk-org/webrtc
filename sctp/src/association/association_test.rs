@@ -2857,3 +2857,155 @@ async fn test_assoc_no_congestion_control_caps_fast_retransmissions() -> Result<
 
     Ok(())
 }
+
+// A chunk lost at the tail of a burst has nothing sent after it to ack, so T3-rtx is its only
+// recovery. Without a congestion window the chunk before it asked for its SACK at once, so the
+// timer restarts within an RTT rather than after the peer's 200ms delayed ack, and the RTO
+// floor is 100ms rather than 400: the tail is back in about 100ms, where it took 600.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_recovers_a_tail_loss_fast() -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.rto_mgr = RtoManager::new_no_congestion_control();
+        a.stats.reset();
+    }
+
+    sbuf[0..4].copy_from_slice(&0u32.to_be_bytes());
+    s0.write_sctp(
+        &Bytes::from(sbuf.clone()),
+        PayloadProtocolIdentifier::Binary,
+    )
+    .await?;
+    for _ in 0..200 {
+        if br.len(0).await == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // The second chunk, the tail, is lost.
+    br.drop_next_nwrites(0, 1);
+    sbuf[0..4].copy_from_slice(&1u32.to_be_bytes());
+    s0.write_sctp(
+        &Bytes::from(sbuf.clone()),
+        PayloadProtocolIdentifier::Binary,
+    )
+    .await?;
+
+    // Tick the bridge from the side while the reader waits for the tail.
+    let ticker = {
+        let br = br.clone();
+        tokio::spawn(async move {
+            for _ in 0..2000 {
+                br.tick().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    let start = tokio::time::Instant::now();
+    let mut buf = vec![0u8; 3000];
+    for i in 0..2u32 {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), s1.read_sctp(&mut buf))
+            .await
+            .expect("the tail never arrived")?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i,
+            "unexpected received data"
+        );
+    }
+    let elapsed = start.elapsed();
+    ticker.abort();
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_t3timeouts(), 1, "recovered by T3-rtx");
+    }
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "the tail took {elapsed:?}; the delayed ack or the old floor is still in the way"
+    );
+
+    br.process().await;
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}
+
+// A fast retransmission restarts T3-rtx without a congestion window. The bridge has no
+// latency, so the SACKs are held for 60ms to put the fast retransmit at t+60, and the resend
+// is then held until t+130: with the RTO locked at 100ms, a timer still running from the first
+// send fires at t+100 and resends everything; restarted at t+60 it does not fire before t+160.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_fast_retransmit_restarts_t3rtx() -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.rto_mgr.set_rto(100, true);
+        a.stats.reset();
+    }
+
+    let t0 = tokio::time::Instant::now();
+    br.drop_next_nwrites(0, 1);
+    for i in 0..4u32 {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+    for _ in 0..200 {
+        if br.len(0).await == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(br.len(0).await, 3, "2..=4 queued, 1 dropped");
+
+    tokio::time::sleep_until(t0 + Duration::from_millis(60)).await;
+    tick_until_fast_retrans(&br, &a0, 1).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_fast_retrans(), 1, "1 fast retransmitted at t+60");
+        assert_eq!(a.stats.get_num_t3timeouts(), 0);
+    }
+
+    tokio::time::sleep_until(t0 + Duration::from_millis(130)).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(
+            a.stats.get_num_t3timeouts(),
+            0,
+            "T3-rtx runs from the fast retransmit, not from the first send"
+        );
+    }
+
+    br.process().await;
+    let mut buf = vec![0u8; 3000];
+    for i in 0..4u32 {
+        let (n, _) = s1.read_sctp(&mut buf).await?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i,
+            "unexpected received data"
+        );
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}

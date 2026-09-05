@@ -9,6 +9,7 @@ use crate::param::param_forward_tsn_supported::ParamForwardTsnSupported;
 use crate::param::param_type::ParamType;
 use crate::param::param_unrecognized::ParamUnrecognized;
 use crate::util::get_padding_size;
+use std::time::{Duration, Instant};
 
 pub struct AssociationInternal {
     pub(crate) name: String,
@@ -63,8 +64,25 @@ pub struct AssociationInternal {
     pub(crate) no_congestion_control: bool,
     /// Send-order stamp for the next DATA chunk transmission
     pub(crate) send_seq: u64,
-    /// Stamps of the chunks the SACK being handled newly acked, evidence for the loss detection
-    pub(crate) sacked_seqs: Vec<u64>,
+    /// Send-order stamp, send time and whether it was the first transmission, for every chunk
+    /// the SACK being handled newly acked: evidence for the loss detection
+    pub(crate) sacked_sends: Vec<(u64, Instant, bool)>,
+    /// Send time of the newest first transmission acked so far; a first transmission acked
+    /// behind it shows the path reorders.
+    newest_acked_sent_at: Option<Instant>,
+    /// Reordering window, RACK's (RFC 8985 sec 6.2): evidence against a chunk must have been
+    /// sent this much after it, or a chunk merely delayed is resent. `reo_wnd_mult` quarters of
+    /// srtt: 0 until reordering is seen, one from then on, one more for every SACK that reports
+    /// duplicate TSNs - the receiver saw a resend's original arrive - at most once per srtt and
+    /// up to a whole srtt; back to one quarter after 16 srtt without duplicates, and to 0 after
+    /// 16 srtt without reordering either.
+    pub(crate) reo_wnd: Duration,
+    pub(crate) reo_wnd_mult: u32,
+    reo_wnd_grown_at: Option<Instant>,
+    /// Last reordering or duplicate report; 16 srtt after it the window closes.
+    pub(crate) reo_wnd_seen_at: Option<Instant>,
+    /// Last duplicate report; 16 srtt after it the window is back to one quarter.
+    pub(crate) reo_wnd_dup_at: Option<Instant>,
 
     // RTX & Ack timer
     pub(crate) rto_mgr: RtoManager,
@@ -180,7 +198,13 @@ impl AssociationInternal {
             fast_recover_exit_point: 0,
             no_congestion_control: no_congestion_control(),
             send_seq: 0,
-            sacked_seqs: vec![],
+            sacked_sends: vec![],
+            newest_acked_sent_at: None,
+            reo_wnd: Duration::ZERO,
+            reo_wnd_mult: 0,
+            reo_wnd_grown_at: None,
+            reo_wnd_seen_at: None,
+            reo_wnd_dup_at: None,
 
             rto_mgr: RtoManager::new(),
             t1init: None,
@@ -503,6 +527,7 @@ impl AssociationInternal {
                     c.nsent += 1;
                     if nocc {
                         c.sent_seq = self.send_seq;
+                        c.sent_at = Instant::now();
                         self.send_seq += 1;
                         c.miss_indicator = 0;
                     }
@@ -1138,6 +1163,9 @@ impl AssociationInternal {
         &mut self,
         d: &ChunkSelectiveAck,
     ) -> Result<(HashMap<u16, i64>, u32)> {
+        if self.no_congestion_control && !d.duplicate_tsn.is_empty() {
+            self.note_spurious_retransmission();
+        }
         let mut bytes_acked_per_stream = HashMap::new();
 
         // New ack point, so pop all ACKed packets from inflight_queue
@@ -1149,7 +1177,7 @@ impl AssociationInternal {
             if let Some(c) = self.inflight_queue.pop(i) {
                 if !c.acked {
                     if self.no_congestion_control {
-                        self.sacked_seqs.push(c.sent_seq);
+                        self.sacked_sends.push((c.sent_seq, c.sent_at, c.nsent == 1));
                     }
                     // RFC 4096 sec 6.3.2.  Retransmission Timer Rules
                     //   R3)  Whenever a SACK is received that acknowledges the DATA chunk
@@ -1230,7 +1258,7 @@ impl AssociationInternal {
                 if let Some(c) = self.inflight_queue.get(tsn) {
                     if !is_acked {
                         if self.no_congestion_control {
-                            self.sacked_seqs.push(c.sent_seq);
+                            self.sacked_sends.push((c.sent_seq, c.sent_at, c.nsent == 1));
                         }
                         // Sum the number of bytes acknowledged per stream
                         if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
@@ -1420,17 +1448,76 @@ impl AssociationInternal {
         Ok(())
     }
 
+    /// The SACK reports duplicate TSNs: a chunk was resent and its original arrived too, so the
+    /// window was too short for this path. One step per srtt, so a burst of duplicates from one
+    /// misjudged round does not count several times.
+    fn note_spurious_retransmission(&mut self) {
+        let now = Instant::now();
+        let srtt = Duration::from_millis(self.rto_mgr.srtt);
+        if self
+            .reo_wnd_grown_at
+            .map_or(true, |t| now.duration_since(t) >= srtt)
+        {
+            self.reo_wnd_mult = (self.reo_wnd_mult + 1).min(4);
+            self.reo_wnd_grown_at = Some(now);
+        }
+        self.reo_wnd_seen_at = Some(now);
+        self.reo_wnd_dup_at = Some(now);
+    }
+
     /// Loss detection when nothing waits on cwnd: a chunk is lost once three chunks sent after
-    /// its latest transmission have been acked. That is RFC 6675's DupThresh counted in send
-    /// order rather than TSN order, so it applies to retransmissions as well, chunks resent
-    /// together are evidence for each other, and so is the later resend of a lower TSN, whether
-    /// the SACK acks it in a gap block or by moving the cumulative point past it. It is not
-    /// suspended during fast recovery: with no cwnd to protect, a lost retransmission is found
-    /// by the next acks rather than by T3-rtx. A SACK does not say which transmission of a chunk
-    /// arrived, so an old copy delivered late counts as its resend would: a false miss
-    /// indication, and possibly a spurious retransmission.
+    /// its latest transmission, and at least the reordering window after it, have been acked.
+    /// That is RFC 6675's DupThresh counted in send order rather than TSN order, so it applies
+    /// to retransmissions as well, chunks resent together are evidence for each other, and so is
+    /// the later resend of a lower TSN, whether the SACK acks it in a gap block or by moving the
+    /// cumulative point past it. It is not suspended during fast recovery: with no cwnd to
+    /// protect, a lost retransmission is found by the next acks rather than by T3-rtx.
+    ///
+    /// The window is what keeps a chunk that is merely late from being resent. A SACK does not
+    /// say which transmission of a chunk arrived, so an old copy delivered late counts as its
+    /// resend would: a false miss indication, and possibly a spurious retransmission. Once the
+    /// path is seen to reorder, evidence has to come from what was sent a quarter of an srtt
+    /// after the chunk - a frame's worth, at 30 frames/s on a 70ms path - and each round of
+    /// duplicates the receiver reports widens that by another quarter.
     fn process_fast_retransmission_nocc(&mut self, cum_tsn_ack_point: u32) -> Result<()> {
-        self.sacked_seqs.sort_unstable();
+        // Reordering this SACK shows: a first transmission acked behind one sent after it. Only
+        // first transmissions can tell, since a SACK does not say which transmission of a resent
+        // chunk arrived; and chunks acked by one SACK count as arriving together.
+        let newest_before = self.newest_acked_sent_at;
+        let mut newest = newest_before;
+        let mut reordered = false;
+        for &(_, at, first) in &self.sacked_sends {
+            if !first {
+                continue;
+            }
+            if newest_before.is_some_and(|n| n > at) {
+                reordered = true;
+            }
+            newest = Some(newest.map_or(at, |n| n.max(at)));
+        }
+        self.newest_acked_sent_at = newest;
+        let now = Instant::now();
+        if reordered {
+            self.reo_wnd_mult = self.reo_wnd_mult.max(1);
+            self.reo_wnd_seen_at = Some(now);
+        }
+        let srtt = Duration::from_millis(self.rto_mgr.srtt);
+        if self
+            .reo_wnd_dup_at
+            .is_some_and(|t| now.duration_since(t) > srtt * 16)
+        {
+            self.reo_wnd_mult = self.reo_wnd_mult.min(1);
+            self.reo_wnd_dup_at = None;
+        }
+        if self
+            .reo_wnd_seen_at
+            .is_some_and(|t| now.duration_since(t) > srtt * 16)
+        {
+            self.reo_wnd_mult = 0;
+            self.reo_wnd_seen_at = None;
+        }
+        self.reo_wnd = (srtt / 4 * self.reo_wnd_mult).min(srtt);
+        self.sacked_sends.sort_unstable();
         let mut fire = false;
         for i in 0..self.inflight_queue.len() {
             if let Some(c) = self
@@ -1440,8 +1527,12 @@ impl AssociationInternal {
                 if c.acked || c.abandoned() || c.miss_indicator >= 3 {
                     continue;
                 }
-                let sent_after =
-                    self.sacked_seqs.len() - self.sacked_seqs.partition_point(|&s| s < c.sent_seq);
+                // Send times are monotonic in send order, so both are prefix cuts.
+                let after_seq = self.sacked_sends.partition_point(|&(s, _, _)| s < c.sent_seq);
+                let after_window = self
+                    .sacked_sends
+                    .partition_point(|&(_, at, _)| at < c.sent_at + self.reo_wnd);
+                let sent_after = self.sacked_sends.len() - after_seq.max(after_window);
                 c.miss_indicator = (c.miss_indicator + sent_after as u32).min(3);
                 if c.miss_indicator == 3 {
                     fire = true;
@@ -1450,7 +1541,7 @@ impl AssociationInternal {
                 return Err(Error::ErrTsnRequestNotExist);
             }
         }
-        self.sacked_seqs.clear();
+        self.sacked_sends.clear();
         if fire {
             self.will_retransmit_fast = true;
             self.awake_write_loop();
@@ -1957,6 +2048,7 @@ impl AssociationInternal {
             c.since = SystemTime::now(); // use to calculate RTT and also for maxPacketLifeTime
             c.nsent = 1; // being sent for the first time
             c.sent_seq = self.send_seq;
+            c.sent_at = Instant::now();
             self.send_seq += 1;
 
             self.check_partial_reliability_status(&c);
@@ -2196,6 +2288,7 @@ impl AssociationInternal {
                 c.nsent += 1;
                 if nocc {
                     c.sent_seq = self.send_seq;
+                    c.sent_at = Instant::now();
                     self.send_seq += 1;
                     c.miss_indicator = 0;
                 }

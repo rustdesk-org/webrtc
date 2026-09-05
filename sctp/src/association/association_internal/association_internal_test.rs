@@ -693,6 +693,13 @@ async fn test_assoc_no_congestion_control_caps_inflight_below_large_rwnd() -> Re
 }
 
 /// Puts TSN 10..=16 in flight with 100-byte chunks sent in TSN order, `sent_seq` == TSN.
+/// The send time that goes with send-order stamp `seq`: a millisecond apart, and a second in the
+/// past so a real transmission stamped by the code under test still comes after all of them.
+fn at(seq: u64) -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(|| Instant::now() - Duration::from_secs(1)) + Duration::from_millis(seq)
+}
+
 fn inflight_10_to_16(a: &mut AssociationInternal) {
     a.cumulative_tsn_ack_point = 9;
     a.my_next_tsn = 17;
@@ -703,8 +710,18 @@ fn inflight_10_to_16(a: &mut AssociationInternal) {
             user_data: Bytes::from(vec![0u8; 100]),
             nsent: 1,
             sent_seq: u64::from(tsn),
+            sent_at: at(u64::from(tsn)),
             ..Default::default()
         });
+    }
+}
+
+/// Models a resend of `tsn` as the `seq`-th transmission of the association.
+fn resent(a: &mut AssociationInternal, tsn: u32, seq: u64) {
+    if let Some(c) = a.inflight_queue.get_mut(tsn) {
+        c.nsent = 2;
+        c.sent_seq = seq;
+        c.sent_at = at(seq);
     }
 }
 
@@ -719,6 +736,15 @@ async fn sack(
     cum: u32,
     gaps: &[(u16, u16)],
 ) -> crate::error::Result<()> {
+    sack_with_dups(a, cum, gaps, &[]).await
+}
+
+async fn sack_with_dups(
+    a: &mut AssociationInternal,
+    cum: u32,
+    gaps: &[(u16, u16)],
+    dups: &[u32],
+) -> crate::error::Result<()> {
     use crate::chunk::chunk_selective_ack::GapAckBlock;
     let d = ChunkSelectiveAck {
         cumulative_tsn_ack: cum,
@@ -727,7 +753,7 @@ async fn sack(
             .iter()
             .map(|&(start, end)| GapAckBlock { start, end })
             .collect(),
-        duplicate_tsn: vec![],
+        duplicate_tsn: dups.to_vec(),
     };
     let (_, htna) = a.process_selective_ack(&d).await?;
     let advanced = sna32lt(a.cumulative_tsn_ack_point, cum);
@@ -746,12 +772,10 @@ async fn test_assoc_no_congestion_control_detects_a_lost_retransmission() -> Res
     for tsn in 13..=16 {
         if let Some(c) = a.inflight_queue.get_mut(tsn) {
             c.sent_seq += 1;
+            c.sent_at = at(c.sent_seq);
         }
     }
-    if let Some(c) = a.inflight_queue.get_mut(10) {
-        c.nsent = 2;
-        c.sent_seq = 13;
-    }
+    resent(&mut a, 10, 13);
     a.send_seq = 18;
 
     sack(&mut a, 9, &[(2, 3), (5, 6)]).await?;
@@ -816,15 +840,9 @@ async fn test_assoc_no_congestion_control_later_resends_of_lower_tsns_are_eviden
     for tsn in [13, 14, 16] {
         a.inflight_queue.mark_as_acked(tsn);
     }
-    if let Some(c) = a.inflight_queue.get_mut(15) {
-        c.nsent = 2;
-        c.sent_seq = 17;
-    }
+    resent(&mut a, 15, 17);
     for tsn in 10..=12 {
-        if let Some(c) = a.inflight_queue.get_mut(tsn) {
-            c.nsent = 2;
-            c.sent_seq = 8 + u64::from(tsn);
-        }
+        resent(&mut a, tsn, 8 + u64::from(tsn));
     }
     a.send_seq = 21;
 
@@ -884,6 +902,84 @@ async fn test_assoc_no_congestion_control_caps_inflight_chunks() -> Result<()> {
         10 * NO_CC_MAX_INFLIGHT_CHUNKS,
         "small chunks are bounded by count, as KCP's segments are"
     );
+
+    Ok(())
+}
+
+// With a reordering window, evidence must have been sent that much after the chunk as well as
+// after it in send order: at a 3ms window, of 11..=13 (sent 1, 2 and 3ms after 10) only 13 is
+// evidence against 10, and 14..=16 then complete the three.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_reordering_window_withholds_evidence() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_16(&mut a);
+    // The chunks' RTT samples are near zero here; hold srtt where the window needs it.
+    a.rto_mgr.srtt = 12;
+    a.rto_mgr.no_update = true;
+    a.reo_wnd_mult = 1;
+
+    sack(&mut a, 9, &[(2, 4)]).await?;
+    assert_eq!(
+        miss_indicator(&a, 10),
+        Some(1),
+        "11 and 12 were sent within the window of 10"
+    );
+    assert!(!a.will_retransmit_fast);
+
+    sack(&mut a, 9, &[(2, 7)]).await?;
+    assert_eq!(miss_indicator(&a, 10), Some(3), "14..=16 are past the window");
+    assert!(a.will_retransmit_fast, "10 is lost");
+
+    Ok(())
+}
+
+// Once the path is seen to reorder the window is a quarter of srtt; each SACK that reports
+// duplicate TSNs adds a quarter, at most once per srtt; 16 srtt without duplicates take it back
+// to one quarter, and 16 srtt without reordering either close it.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_widens_the_window_on_duplicates() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.rto_mgr.srtt = 40;
+    a.rto_mgr.no_update = true;
+    inflight_10_to_16(&mut a);
+
+    sack(&mut a, 9, &[(4, 4)]).await?;
+    assert_eq!(a.reo_wnd, Duration::ZERO, "in order so far");
+
+    sack(&mut a, 9, &[(2, 2), (4, 4)]).await?;
+    assert_eq!(
+        a.reo_wnd,
+        Duration::from_millis(10),
+        "11 acked behind 13: a quarter of srtt"
+    );
+
+    sack_with_dups(&mut a, 9, &[(2, 2), (4, 5)], &[11]).await?;
+    assert_eq!(
+        a.reo_wnd,
+        Duration::from_millis(20),
+        "a duplicate reported: one quarter more"
+    );
+
+    sack_with_dups(&mut a, 9, &[(2, 2), (4, 6)], &[12]).await?;
+    assert_eq!(
+        a.reo_wnd,
+        Duration::from_millis(20),
+        "not again within an srtt"
+    );
+
+    a.reo_wnd_dup_at = Some(Instant::now() - Duration::from_secs(1));
+    sack(&mut a, 9, &[(2, 2), (4, 6)]).await?;
+    assert_eq!(
+        a.reo_wnd,
+        Duration::from_millis(10),
+        "16 srtt without duplicates: back to a quarter"
+    );
+
+    a.reo_wnd_seen_at = Some(Instant::now() - Duration::from_secs(1));
+    sack(&mut a, 9, &[(2, 2), (4, 7)]).await?;
+    assert_eq!(a.reo_wnd, Duration::ZERO, "16 srtt in order close it");
 
     Ok(())
 }

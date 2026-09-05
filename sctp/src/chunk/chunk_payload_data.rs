@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use portable_atomic::AtomicBool;
@@ -116,6 +116,9 @@ pub struct ChunkPayloadData {
     /// Place of this chunk's latest transmission in the association's send order; an ack for
     /// anything sent from there on is evidence that transmission is lost.
     pub(crate) sent_seq: u64,
+    /// When the latest transmission went out. Evidence against it must have been sent this much
+    /// later than it, by the association's reordering window.
+    pub(crate) sent_at: Instant,
 
     /// valid only with the first fragment
     pub(crate) abandoned: Arc<AtomicBool>,
@@ -144,6 +147,7 @@ impl Default for ChunkPayloadData {
             since: SystemTime::now(),
             nsent: 0,
             sent_seq: 0,
+            sent_at: Instant::now(),
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
@@ -224,6 +228,7 @@ impl Chunk for ChunkPayloadData {
             since: SystemTime::now(),
             nsent: 0,
             sent_seq: 0,
+            sent_at: Instant::now(),
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,

@@ -3009,3 +3009,131 @@ async fn test_assoc_no_congestion_control_fast_retransmit_restarts_t3rtx() -> Re
 
     Ok(())
 }
+
+// A chunk past the fast-retransmission cap is T3-rtx's, and must reach it while other chunks
+// keep being fast retransmitted: only a resend of the earliest chunk in flight restarts the
+// timer, so the RTO runs on from TSN 1's last resend however many later chunks are resent in
+// the meantime. Here a chunk is lost and fast retransmitted every 30ms or so for 160ms, well
+// past the 100ms RTO.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_capped_chunk_reaches_t3rtx_under_fast_retransmissions(
+) -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.rto_mgr.set_rto(100, true);
+        a.stats.reset();
+    }
+
+    // TSN 1 is lost, and so is every fast retransmission of it, up to the cap.
+    let mut written = 0u32;
+    br.drop_next_nwrites(0, 1);
+    for _ in 0..4 {
+        sbuf[0..4].copy_from_slice(&written.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+        written += 1;
+    }
+    for round in 1..=NO_CC_FAST_RETRANS_LIMIT as u64 {
+        for _ in 0..200 {
+            if br.len(0).await >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        br.drop_next_nwrites(0, 1);
+        tick_until_fast_retrans(&br, &a0, round).await;
+        for _ in 0..3 {
+            sbuf[0..4].copy_from_slice(&written.to_be_bytes());
+            s0.write_sctp(
+                &Bytes::from(sbuf.clone()),
+                PayloadProtocolIdentifier::Binary,
+            )
+            .await?;
+            written += 1;
+        }
+    }
+    let capped_at = tokio::time::Instant::now();
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_fast_retrans(), NO_CC_FAST_RETRANS_LIMIT as u64);
+        assert_eq!(a.stats.get_num_t3timeouts(), 0);
+    }
+
+    // Later chunks keep being lost and fast retransmitted, the first of every four, in rounds
+    // of about 30ms: well inside the RTO, so a timer that any resend restarted would never fire.
+    let mut later = 0u64;
+    while capped_at.elapsed() < Duration::from_millis(200) {
+        br.drop_next_nwrites(0, 1);
+        for _ in 0..4 {
+            sbuf[0..4].copy_from_slice(&written.to_be_bytes());
+            s0.write_sctp(
+                &Bytes::from(sbuf.clone()),
+                PayloadProtocolIdentifier::Binary,
+            )
+            .await?;
+            written += 1;
+        }
+        for _ in 0..200 {
+            if br.len(0).await >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for _ in 0..20 {
+            br.tick().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        later += 1;
+    }
+    assert!(later >= 4, "rounds inside one RTO: {later}");
+    {
+        let a = a0.association_internal.lock().await;
+        assert!(
+            a.stats.get_num_fast_retrans() > NO_CC_FAST_RETRANS_LIMIT as u64,
+            "later chunks were fast retransmitted"
+        );
+        assert!(
+            a.stats.get_num_t3timeouts() >= 1,
+            "T3-rtx reached the capped chunk under {later} rounds of later fast retransmissions"
+        );
+    }
+
+    // Read with the bridge ticking alongside: a resend can still be on a timer.
+    let ticker = {
+        let br = br.clone();
+        tokio::spawn(async move {
+            for _ in 0..3000 {
+                br.tick().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    let mut buf = vec![0u8; 3000];
+    for i in 0..written {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), s1.read_sctp(&mut buf))
+            .await
+            .expect("data never arrived")?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i,
+            "unexpected received data"
+        );
+    }
+    ticker.abort();
+    br.process().await;
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}

@@ -70,12 +70,13 @@ pub struct AssociationInternal {
     /// Send time of the newest first transmission acked so far; a first transmission acked
     /// behind it shows the path reorders.
     newest_acked_sent_at: Option<Instant>,
-    /// Reordering window, RACK's (RFC 8985 sec 6.2): evidence against a chunk must have been
-    /// sent this much after it, or a chunk merely delayed is resent. `reo_wnd_mult` quarters of
-    /// srtt: 0 until reordering is seen, one from then on, one more for every SACK that reports
-    /// duplicate TSNs - the receiver saw a resend's original arrive - at most once per srtt and
-    /// up to a whole srtt; back to one quarter after 16 srtt without duplicates, and to 0 after
-    /// 16 srtt without reordering either.
+    /// Reordering window, after RACK (RFC 8985 sec 6.2) with SCTP's DupThresh of three kept:
+    /// evidence against a chunk must have been sent this much after it, or a chunk merely
+    /// delayed is resent. `reo_wnd_mult` quarters of srtt: 0 until reordering is seen, one from
+    /// then on, one more for every SACK that reports duplicate TSNs - the receiver saw a
+    /// resend's original arrive - at most once per srtt and up to a whole srtt. 16 srtt without
+    /// duplicates take it back to one quarter while reordering goes on; 16 srtt without
+    /// reordering close it, whatever the duplicates had made it.
     pub(crate) reo_wnd: Duration,
     pub(crate) reo_wnd_mult: u32,
     reo_wnd_grown_at: Option<Instant>,
@@ -661,12 +662,17 @@ impl AssociationInternal {
                     .await;
                 let before = raw_packets.len();
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets);
-                if self.no_congestion_control && raw_packets.len() > before {
-                    // A fast retransmission restarts T3-rtx, as a KCP resend restarts the
-                    // segment's own timer. RFC 4960 leaves the timer running from the
-                    // earliest chunk's first send, and at RTO_MIN_NO_CC that is before the
-                    // resend can be acked: T3 would fire on a loss fast retransmit had already
-                    // recovered and resend everything in flight for nothing.
+                if self.no_congestion_control
+                    && self.fast_retransmitted_earliest(&raw_packets[before..])
+                {
+                    // A fast retransmission of the earliest chunk in flight restarts T3-rtx,
+                    // as a KCP resend restarts the segment's own timer. RFC 4960 leaves the
+                    // timer running from that chunk's first send, and at RTO_MIN_NO_CC that
+                    // is before the resend can be acked: T3 would fire on a loss fast
+                    // retransmit had already recovered and resend everything in flight for
+                    // nothing. Only the earliest: the timer is that chunk's, and a resend of
+                    // a later one must not defer it, or a chunk past the fast retransmission
+                    // cap, left to T3-rtx, never reaches it while others keep being resent.
                     if let Some(t3rtx) = &self.t3rtx {
                         t3rtx.stop().await;
                         t3rtx.start(self.rto_mgr.get_rto()).await;
@@ -1463,6 +1469,18 @@ impl AssociationInternal {
         }
 
         Ok(())
+    }
+
+    /// Whether these fast-retransmission packets carry the earliest chunk in flight.
+    fn fast_retransmitted_earliest(&self, packets: &[Packet]) -> bool {
+        let earliest = self.cumulative_tsn_ack_point + 1;
+        packets.iter().any(|p| {
+            p.chunks.iter().any(|c| {
+                c.as_any()
+                    .downcast_ref::<ChunkPayloadData>()
+                    .is_some_and(|d| d.tsn == earliest)
+            })
+        })
     }
 
     /// The SACK reports duplicate TSNs: a chunk was resent and its original arrived too, so the

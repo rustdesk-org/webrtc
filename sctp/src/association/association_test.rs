@@ -3137,3 +3137,104 @@ async fn test_assoc_no_congestion_control_capped_chunk_reaches_t3rtx_under_fast_
 
     Ok(())
 }
+
+// The same while shutting down: the data still in flight after `shutdown()` is recovered by
+// the same fast retransmission, and its T3-rtx restart must come with it, or the closing
+// association resends everything on a loss it had already recovered.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_fast_retransmit_restarts_t3rtx_while_shutting_down(
+) -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    let a0 = Arc::new(a0);
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.rto_mgr.set_rto(100, true);
+        a.stats.reset();
+    }
+
+    let t0 = tokio::time::Instant::now();
+    br.drop_next_nwrites(0, 1);
+    for i in 0..4u32 {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+    for _ in 0..200 {
+        if br.len(0).await == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(br.len(0).await, 3, "2..=4 queued, 1 dropped");
+    // Data in flight, so this parks the association in ShutdownPending; `shutdown()` itself
+    // blocks until the handshake completes, which needs the bridge ticked.
+    let shutdown = {
+        let a0 = a0.clone();
+        tokio::spawn(async move { a0.shutdown().await })
+    };
+    for _ in 0..200 {
+        if a0.get_state() == AssociationState::ShutdownPending {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(a0.get_state(), AssociationState::ShutdownPending);
+
+    tokio::time::sleep_until(t0 + Duration::from_millis(60)).await;
+    tick_until_fast_retrans(&br, &a0, 1).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_fast_retrans(), 1, "1 fast retransmitted at t+60");
+        assert_eq!(a.stats.get_num_t3timeouts(), 0);
+    }
+
+    tokio::time::sleep_until(t0 + Duration::from_millis(130)).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(
+            a.stats.get_num_t3timeouts(),
+            0,
+            "T3-rtx runs from the fast retransmit, not from the first send"
+        );
+    }
+
+    // Tick from the side: the resend, the data, and then the shutdown handshake.
+    let ticker = {
+        let br = br.clone();
+        tokio::spawn(async move {
+            for _ in 0..3000 {
+                br.tick().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    let mut buf = vec![0u8; 3000];
+    for i in 0..4u32 {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), s1.read_sctp(&mut buf))
+            .await
+            .expect("data never arrived")?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i,
+            "unexpected received data"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(3), shutdown)
+        .await
+        .expect("the shutdown never completed")
+        .expect("the shutdown task panicked")?;
+    ticker.abort();
+    let _ = a1.close().await;
+
+    Ok(())
+}

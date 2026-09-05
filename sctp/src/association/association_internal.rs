@@ -660,24 +660,9 @@ impl AssociationInternal {
                 raw_packets = self
                     .gather_outbound_data_and_reconfig_packets(raw_packets)
                     .await;
-                let before = raw_packets.len();
-                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets);
-                if self.no_congestion_control
-                    && self.fast_retransmitted_earliest(&raw_packets[before..])
-                {
-                    // A fast retransmission of the earliest chunk in flight restarts T3-rtx,
-                    // as a KCP resend restarts the segment's own timer. RFC 4960 leaves the
-                    // timer running from that chunk's first send, and at RTO_MIN_NO_CC that
-                    // is before the resend can be acked: T3 would fire on a loss fast
-                    // retransmit had already recovered and resend everything in flight for
-                    // nothing. Only the earliest: the timer is that chunk's, and a resend of
-                    // a later one must not defer it, or a chunk past the fast retransmission
-                    // cap, left to T3-rtx, never reaches it while others keep being resent.
-                    if let Some(t3rtx) = &self.t3rtx {
-                        t3rtx.stop().await;
-                        t3rtx.start(self.rto_mgr.get_rto()).await;
-                    }
-                }
+                raw_packets = self
+                    .gather_outbound_fast_retransmission_packets_restarting_t3rtx(raw_packets)
+                    .await;
                 raw_packets = self.gather_outbound_sack_packets(raw_packets).await;
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 (raw_packets, true)
@@ -686,7 +671,9 @@ impl AssociationInternal {
             | AssociationState::ShutdownSent
             | AssociationState::ShutdownReceived => {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
-                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets);
+                raw_packets = self
+                    .gather_outbound_fast_retransmission_packets_restarting_t3rtx(raw_packets)
+                    .await;
                 raw_packets = self.gather_outbound_sack_packets(raw_packets).await;
                 self.gather_outbound_shutdown_packets(raw_packets).await
             }
@@ -1469,6 +1456,32 @@ impl AssociationInternal {
         }
 
         Ok(())
+    }
+
+    /// Fast retransmission, and the T3-rtx restart it calls for without a congestion window -
+    /// while data is still in flight, which the shutdown states are as much as Established.
+    async fn gather_outbound_fast_retransmission_packets_restarting_t3rtx(
+        &mut self,
+        mut raw_packets: Vec<Packet>,
+    ) -> Vec<Packet> {
+        let before = raw_packets.len();
+        raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets);
+        if self.no_congestion_control && self.fast_retransmitted_earliest(&raw_packets[before..])
+        {
+            // A fast retransmission of the earliest chunk in flight restarts T3-rtx, as a
+            // KCP resend restarts the segment's own timer. RFC 4960 leaves the timer running
+            // from that chunk's first send, and at RTO_MIN_NO_CC that is before the resend
+            // can be acked: T3 would fire on a loss fast retransmit had already recovered and
+            // resend everything in flight for nothing. Only the earliest: the timer is that
+            // chunk's, and a resend of a later one must not defer it, or a chunk past the
+            // fast retransmission cap, left to T3-rtx, never reaches it while others keep
+            // being resent.
+            if let Some(t3rtx) = &self.t3rtx {
+                t3rtx.stop().await;
+                t3rtx.start(self.rto_mgr.get_rto()).await;
+            }
+        }
+        raw_packets
     }
 
     /// Whether these fast-retransmission packets carry the earliest chunk in flight.

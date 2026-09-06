@@ -16,17 +16,19 @@
 //! LOSS=0           % of packets lost, both ways        BURST_MS=0    mean length of a loss burst
 //! JITTER=0         ms of queueing-style jitter         JITTER_IID=1  independent per packet instead
 //! REORDER=0        per mille sent REORDER_MS early     QUEUE_MS=0    buffer; longer waits are dropped
-//! SPIKE_EVERY=0 SPIKE_MS=0      nothing delivered for SPIKE_MS every SPIKE_EVERY ms
+//! SPIKE_EVERY=0 SPIKE_MS=0      the link sends nothing for SPIKE_MS every SPIKE_EVERY ms
 //! DIP_EVERY=0 DIP_MS=0 DIP_RATE=1  the link runs at DIP_RATE Mbps for DIP_MS every DIP_EVERY ms
 //! FRAME=12000 FPS=30 FRAMES=300     the workload: FRAMES frames of FRAME bytes at FPS
 //! GAP_EVERY=0 GAP_MS=0              pause GAP_MS after every GAP_EVERY frames: bursts with tails
-//! TAILDROP=0                        drop the last TAILDROP packets of every burst's last frame
+//! TAILDROP=0                        drop the last TAILDROP packets of every burst
 //! SEED=1 DEADLINE=60
 //! ```
 //!
 //! Loss, jitter and the channel state are one time-domain trace per direction, drawn from the
-//! seed at a millisecond a tick, so every transport run with the same seed sees the same path;
-//! only independent per-packet loss (`BURST_MS=0`) is drawn per packet. Independent per-packet
+//! seed at a millisecond a tick, and the path's clock starts with the workload rather than
+//! with the handshake, so every transport run with the same seed sees the same path; only
+//! independent per-packet loss (`BURST_MS=0`) is drawn per packet. Wire figures count the
+//! workload only, not the handshake. `RUST_LOG=webrtc_sctp=trace` logs the associations. Independent per-packet
 //! jitter (`JITTER_IID=1`) reorders far more than any real path and is kept only because that
 //! is what first showed fast retransmission misfiring on reordering; the default jitter is a
 //! random walk shared by consecutive packets, delivered in order, as a queue jitters.
@@ -164,7 +166,7 @@ struct Impair {
     reorder_by: Duration,
     /// A packet whose queueing wait would exceed this is dropped at the buffer's tail.
     queue: Duration,
-    /// Every `spike_every`, nothing is delivered for `spike_len`; packets queue behind it.
+    /// Every `spike_every`, the link sends nothing for `spike_len`; packets queue behind it.
     spike_every: Duration,
     spike_len: Duration,
     /// Every `dip_every`, the link runs at `dip_rate_mbps` for `dip_len`.
@@ -176,6 +178,7 @@ struct Impair {
     drop_next: Arc<AtomicU64>,
     drop_skip: Arc<AtomicU64>,
     trace: Arc<PathTrace>,
+    epoch: Arc<std::sync::Mutex<Instant>>,
 }
 
 fn pipe(
@@ -188,9 +191,8 @@ fn pipe(
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Bytes>();
     tokio::spawn(async move {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let epoch = Instant::now();
-        let mut last_depart = epoch;
-        let mut last_at = epoch;
+        let mut last_depart = Instant::now();
+        let mut last_at = last_depart;
         let mut heap: BinaryHeap<Scheduled> = BinaryHeap::new();
         let mut seq = 0u64;
         let mut open = true;
@@ -203,18 +205,35 @@ fn pipe(
                 biased;
                 item = in_rx.recv(), if open => match item {
                     Some((sent, b)) => {
-                        stats.pkts.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes.fetch_add((b.len() + im.overhead) as u64, Ordering::Relaxed);
                         let impaired = loss_on.load(Ordering::Relaxed);
-                        let since = sent.duration_since(epoch);
+                        if impaired {
+                            stats.pkts.fetch_add(1, Ordering::Relaxed);
+                            stats
+                                .bytes
+                                .fetch_add((b.len() + im.overhead) as u64, Ordering::Relaxed);
+                        }
+                        // The path's clock starts with the workload, the same for every
+                        // transport and both directions.
+                        let epoch = *im.epoch.lock().unwrap();
+                        let since = sent.saturating_duration_since(epoch);
                         let (jitter_us, bad) = im.trace.at(since);
                         // Serialization: packets go out back to back at the link rate, so a
-                        // burst spreads out and queues behind itself.
-                        let start_tx = sent.max(last_depart);
+                        // burst spreads out and queues behind itself. A stall is the link
+                        // sending nothing: what was queued goes out at the link rate after it.
+                        let mut start_tx = sent.max(last_depart);
+                        if impaired && !im.spike_every.is_zero() {
+                            let phase = Duration::from_micros(
+                                (start_tx.saturating_duration_since(epoch).as_micros()
+                                    % im.spike_every.as_micros()) as u64,
+                            );
+                            if phase < im.spike_len {
+                                start_tx += im.spike_len - phase;
+                            }
+                        }
                         let dipped = impaired
                             && !im.dip_every.is_zero()
                             && Duration::from_micros(
-                                (start_tx.duration_since(epoch).as_micros()
+                                (start_tx.saturating_duration_since(epoch).as_micros()
                                     % im.dip_every.as_micros()) as u64,
                             ) < im.dip_len;
                         let rate = if dipped { im.dip_rate_mbps } else { im.rate_mbps };
@@ -251,14 +270,6 @@ fn pipe(
                                 );
                             } else {
                                 at += Duration::from_micros(u64::from(jitter_us));
-                            }
-                        }
-                        if impaired && !im.spike_every.is_zero() {
-                            let phase = Duration::from_micros(
-                                (since.as_micros() % im.spike_every.as_micros()) as u64,
-                            );
-                            if phase < im.spike_len {
-                                at += im.spike_len - phase;
                             }
                         }
                         if impaired && im.reorder > 0 && rng.gen_range(0..1000u64) < im.reorder {
@@ -313,6 +324,8 @@ struct Link {
     trace_ticks: usize,
     drop_next: Arc<AtomicU64>,
     drop_skip: Arc<AtomicU64>,
+    /// When the workload started: the path's clock.
+    epoch: Arc<std::sync::Mutex<Instant>>,
     loss_on: Arc<AtomicBool>,
     ab: Arc<LinkStats>,
     ba: Arc<LinkStats>,
@@ -347,6 +360,7 @@ impl Link {
             } else {
                 self.drop_skip.clone()
             },
+            epoch: self.epoch.clone(),
             trace: Arc::new(PathTrace::new(
                 seed,
                 self.trace_ticks,
@@ -429,6 +443,8 @@ impl Conn for DelayedConn {
 
 #[derive(Clone)]
 struct Workload {
+    /// Packets a frame takes on this transport, for `tail_drop`.
+    frame_packets: u64,
     frame: usize,
     frames: usize,
     interval: Duration,
@@ -439,8 +455,8 @@ struct Workload {
 }
 
 impl Workload {
-    /// When to send frame `i` next, and the tail drop to arm before it: a frame of several
-    /// packets loses its own last packets, frames of one packet lose the last frames.
+    /// When to send frame `i` next, and the tail drop to arm before it: the last `tail_drop`
+    /// packets of the burst, however many frames they span.
     fn step(&self, i: usize, next: &mut Instant, drop_next: &AtomicU64, drop_skip: &AtomicU64) {
         *next += self.interval;
         if self.gap_every > 0 && (i + 1) % self.gap_every == 0 {
@@ -449,15 +465,28 @@ impl Workload {
         if self.tail_drop == 0 || self.gap_every == 0 {
             return;
         }
-        let packets = (self.frame.max(1) as u64).div_ceil(1160);
-        if packets >= self.tail_drop {
-            if (i + 1) % self.gap_every == 0 {
-                drop_skip.store(packets - self.tail_drop, Ordering::Relaxed);
-                drop_next.store(self.tail_drop, Ordering::Relaxed);
-            }
-        } else if i % self.gap_every == self.gap_every - self.tail_drop as usize {
+        let frames = self.tail_drop.div_ceil(self.frame_packets) as usize;
+        if i % self.gap_every == self.gap_every - frames {
+            drop_skip.store(
+                frames as u64 * self.frame_packets - self.tail_drop,
+                Ordering::Relaxed,
+            );
             drop_next.store(self.tail_drop, Ordering::Relaxed);
         }
+    }
+}
+
+/// Packets a frame takes: SCTP fragments the message at RustDesk's 60000 bytes and chunks at
+/// this crate's 1160-byte payload; KCP segments the 4-byte-prefixed frame at its 1176-byte MSS.
+fn frame_packets(frame: usize, proto: &str) -> u64 {
+    let frame = frame.max(8) as u64;
+    if proto == "kcp" {
+        (frame + 4).div_ceil(1176)
+    } else {
+        (0..frame)
+            .step_by(60000)
+            .map(|off| (frame - off).min(60000).div_ceil(1160))
+            .sum()
     }
 }
 
@@ -528,8 +557,9 @@ async fn run_sctp(w: &Workload, link: &Link, nc: bool) -> Report {
     let mut buf = vec![0u8; 65536];
     s1.read_sctp(&mut buf).await.unwrap();
 
-    link.loss_on.store(true, Ordering::Relaxed);
     let start = Instant::now();
+    *link.epoch.lock().unwrap() = start;
+    link.loss_on.store(true, Ordering::Relaxed);
     let frames = w.frames;
     let lat: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::default();
     let lat2 = lat.clone();
@@ -656,8 +686,9 @@ async fn run_kcp(w: &Workload, link: &Link, nc: bool) -> Report {
     let mut sa = KcpStream::new(&ea, conn_a.unwrap()).unwrap();
     let mut sb = KcpStream::new(&eb, conn_b.unwrap()).unwrap();
 
-    link.loss_on.store(true, Ordering::Relaxed);
     let start = Instant::now();
+    *link.epoch.lock().unwrap() = start;
+    link.loss_on.store(true, Ordering::Relaxed);
     let frames = w.frames;
     let lat: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::default();
     let lat2 = lat.clone();
@@ -714,11 +745,16 @@ fn pct(sorted: &[Duration], p: f64) -> f64 {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    let _ = env_logger::Builder::from_default_env()
+        .format_timestamp_micros()
+        .try_init();
     let proto = std::env::var("PROTO").unwrap_or_else(|_| "sctp".into());
     let nc = env_u64("NC", 1) == 1;
     let rate = env_u64("RATE", 30);
+    let frame = env_u64("FRAME", 12000) as usize;
     let w = Workload {
-        frame: env_u64("FRAME", 12000) as usize,
+        frame_packets: frame_packets(frame, &proto),
+        frame,
         frames: env_u64("FRAMES", 300) as usize,
         interval: Duration::from_micros(1_000_000 / env_u64("FPS", 30)),
         deadline: Duration::from_secs(env_u64("DEADLINE", 60)),
@@ -748,10 +784,15 @@ async fn main() {
         trace_ticks: (w.deadline.as_millis() as usize) + 10_000,
         drop_next: Arc::default(),
         drop_skip: Arc::default(),
+        epoch: Arc::new(std::sync::Mutex::new(Instant::now())),
         loss_on: Arc::new(AtomicBool::new(false)),
         ab: Arc::new(LinkStats::default()),
         ba: Arc::new(LinkStats::default()),
     };
+    assert!(
+        w.tail_drop <= w.gap_every as u64 * w.frame_packets,
+        "TAILDROP exceeds a burst's packets"
+    );
     let r = match proto.as_str() {
         "sctp" => run_sctp(&w, &link, nc).await,
         "kcp" => run_kcp(&w, &link, nc).await,

@@ -688,7 +688,9 @@ impl AssociationInternal {
         let state = self.get_state();
         match state {
             AssociationState::Established => {
-                raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
+                raw_packets = self
+                    .gather_data_packets_to_retransmit_restarting_t3rtx(raw_packets)
+                    .await;
                 raw_packets = self
                     .gather_outbound_data_and_reconfig_packets(raw_packets)
                     .await;
@@ -702,7 +704,9 @@ impl AssociationInternal {
             AssociationState::ShutdownPending
             | AssociationState::ShutdownSent
             | AssociationState::ShutdownReceived => {
-                raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
+                raw_packets = self
+                    .gather_data_packets_to_retransmit_restarting_t3rtx(raw_packets)
+                    .await;
                 raw_packets = self
                     .gather_outbound_fast_retransmission_packets_restarting_t3rtx(raw_packets)
                     .await;
@@ -1495,6 +1499,29 @@ impl AssociationInternal {
         }
 
         Ok(())
+    }
+
+    /// The timeout's retransmissions, and the T3-rtx restart a probe calls for without a
+    /// congestion window: a probe drawn by a SACK goes out after that SACK restarted the timer
+    /// from the previous send, with little of the RTO left, and the timer would fire again
+    /// before the probe's ack could arrive; so, as a fast retransmission of the earliest chunk
+    /// does, a probe restarts T3-rtx from its own send.
+    async fn gather_data_packets_to_retransmit_restarting_t3rtx(
+        &mut self,
+        mut raw_packets: Vec<Packet>,
+    ) -> Vec<Packet> {
+        let before = raw_packets.len();
+        raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
+        if self.no_congestion_control
+            && self.t3_withheld_since.is_some()
+            && raw_packets.len() > before
+        {
+            if let Some(t3rtx) = &self.t3rtx {
+                t3rtx.stop().await;
+                t3rtx.start(self.rto_mgr.get_rto()).await;
+            }
+        }
+        raw_packets
     }
 
     /// Fast retransmission, and the T3-rtx restart it calls for without a congestion window -

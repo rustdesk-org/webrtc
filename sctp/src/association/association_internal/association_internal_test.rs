@@ -1002,6 +1002,24 @@ fn inflight_10_to_14_of_500(a: &mut AssociationInternal) {
     }
 }
 
+/// Puts TSN 10..=19 in flight with 500-byte chunks: more than a T3-rtx resends at once.
+fn inflight_10_to_19_of_500(a: &mut AssociationInternal) {
+    a.cumulative_tsn_ack_point = 9;
+    a.my_next_tsn = 20;
+    a.send_seq = 20;
+    a.rwnd = 100_000;
+    for tsn in 10..=19 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            tsn,
+            user_data: Bytes::from(vec![0u8; 500]),
+            nsent: 1,
+            sent_seq: u64::from(tsn),
+            sent_at: at(u64::from(tsn)),
+            ..Default::default()
+        });
+    }
+}
+
 fn tsns(packets: &[Packet]) -> Vec<u32> {
     packets
         .iter()
@@ -1022,7 +1040,7 @@ async fn t3_expires(a: &mut AssociationInternal) -> Vec<Packet> {
 async fn test_assoc_no_congestion_control_t3_resends_one_packet() -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
-    inflight_10_to_14_of_500(&mut a);
+    inflight_10_to_19_of_500(&mut a);
 
     let packets = t3_expires(&mut a).await;
     assert_eq!(packets.len(), 1, "one packet");
@@ -1037,9 +1055,55 @@ async fn test_assoc_no_congestion_control_t3_resends_one_packet() -> Result<()> 
     );
     assert_eq!(
         a.inflight_queue.get_num_bytes_to_retransmit(),
-        1500,
+        4000,
         "marked meanwhile"
     );
+
+    Ok(())
+}
+
+// A short tail outstanding, whatever it fits in NO_CC_T3_TAIL_PACKETS packets, goes out at
+// once; a longer backlog may only be queued behind a stall, and is probed.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_resends_a_short_tail_at_once() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+
+    let packets = t3_expires(&mut a).await;
+    assert!(a.t3_withheld_since.is_none(), "a short tail: not a probe");
+    assert_eq!(tsns(&packets), vec![10, 11, 12, 13, 14], "the whole tail");
+
+    // Left over from an earlier timeout that probed, the withholding must not hold a short
+    // tail back.
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+    a.t3_withheld_since = Some(0);
+    a.t3_probe_sent = true;
+    let packets = t3_expires(&mut a).await;
+    assert!(a.t3_withheld_since.is_none(), "superseded");
+    assert_eq!(tsns(&packets), vec![10, 11, 12, 13, 14]);
+
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+    for tsn in 15..=24 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            tsn,
+            user_data: Bytes::from(vec![0u8; 500]),
+            nsent: 1,
+            sent_seq: u64::from(tsn),
+            sent_at: at(u64::from(tsn)),
+            ..Default::default()
+        });
+    }
+    a.my_next_tsn = 25;
+    a.send_seq = 25;
+
+    let packets = t3_expires(&mut a).await;
+    assert!(a.t3_withheld_since.is_some(), "a long tail: probed");
+    assert_eq!(tsns(&packets), vec![10, 11]);
 
     Ok(())
 }
@@ -1050,7 +1114,7 @@ async fn test_assoc_no_congestion_control_t3_resends_one_packet() -> Result<()> 
 async fn test_assoc_no_congestion_control_t3_early_timeout_resends_nothing_more() -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
-    inflight_10_to_14_of_500(&mut a);
+    inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
 
     sack(&mut a, 9, &[(3, 3)]).await?;
@@ -1072,10 +1136,10 @@ async fn test_assoc_no_congestion_control_t3_resends_the_rest_once_later_data_is
 ) -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
-    inflight_10_to_14_of_500(&mut a);
+    inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
     a.inflight_queue.push_no_check(ChunkPayloadData {
-        tsn: 15,
+        tsn: 20,
         user_data: Bytes::from(vec![0u8; 500]),
         nsent: 1,
         sent_seq: a.send_seq,
@@ -1087,15 +1151,15 @@ async fn test_assoc_no_congestion_control_t3_resends_the_rest_once_later_data_is
     sack(&mut a, 11, &[]).await?;
     assert!(
         a.t3_withheld_since.is_some(),
-        "the probe alone: wait for 15"
+        "the probe alone: wait for 20"
     );
     assert!(a.get_data_packets_to_retransmit().is_empty());
 
-    sack(&mut a, 11, &[(4, 4)]).await?;
-    assert!(a.t3_withheld_since.is_none(), "15 arrived, 12..=14 did not");
+    sack(&mut a, 11, &[(9, 9)]).await?;
+    assert!(a.t3_withheld_since.is_none(), "20 arrived, 12..=19 did not");
     assert_eq!(
         tsns(&a.get_data_packets_to_retransmit()),
-        vec![12, 13, 14],
+        (12..=19).collect::<Vec<u32>>(),
         "the rest go out"
     );
 
@@ -1109,12 +1173,12 @@ async fn test_assoc_no_congestion_control_t3_settlement_respects_the_reordering_
 ) -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
-    inflight_10_to_14_of_500(&mut a);
+    inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
     a.t3_at = Instant::now() - Duration::from_millis(30);
     for (tsn, sent_at) in [
-        (15, Instant::now() - Duration::from_millis(20)),
-        (16, Instant::now()),
+        (20, Instant::now() - Duration::from_millis(20)),
+        (21, Instant::now()),
     ] {
         a.inflight_queue.push_no_check(ChunkPayloadData {
             tsn,
@@ -1128,16 +1192,16 @@ async fn test_assoc_no_congestion_control_t3_settlement_respects_the_reordering_
     }
 
     a.reo_wnd = Duration::from_millis(25);
-    sack(&mut a, 11, &[(4, 4)]).await?;
+    sack(&mut a, 11, &[(9, 9)]).await?;
     assert!(
         a.t3_withheld_since.is_some(),
-        "15 went out 10ms after the timeout, within the window: not yet"
+        "20 went out 10ms after the timeout, within the window: not yet"
     );
 
     a.reo_wnd = Duration::from_millis(25);
-    sack(&mut a, 11, &[(4, 5)]).await?;
-    assert!(a.t3_withheld_since.is_none(), "16 went out past the window");
-    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), vec![12, 13, 14]);
+    sack(&mut a, 11, &[(9, 10)]).await?;
+    assert!(a.t3_withheld_since.is_none(), "21 went out past the window");
+    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), (12..=19).collect::<Vec<u32>>());
 
     Ok(())
 }
@@ -1150,7 +1214,7 @@ async fn test_assoc_no_congestion_control_t3_resends_the_rest_when_nothing_else_
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
     a.min_rtt = Some(70);
-    inflight_10_to_14_of_500(&mut a);
+    inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
 
     // A SACK for the probe's TSN right after the probe went out is the original arriving
@@ -1162,13 +1226,13 @@ async fn test_assoc_no_congestion_control_t3_resends_the_rest_when_nothing_else_
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
     a.min_rtt = Some(70);
-    inflight_10_to_14_of_500(&mut a);
+    inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
     a.t3_probe_sent_at = Instant::now() - Duration::from_millis(70);
 
     sack(&mut a, 11, &[]).await?;
     assert!(a.t3_withheld_since.is_none(), "an RTT later: the probe's own ack");
-    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), vec![12, 13, 14]);
+    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), (12..=19).collect::<Vec<u32>>());
 
     Ok(())
 }
@@ -1182,7 +1246,7 @@ async fn test_assoc_no_congestion_control_t3_probe_duplicates_do_not_widen_the_w
     a.no_congestion_control = true;
     a.rto_mgr.srtt = 40;
     a.rto_mgr.no_update = true;
-    inflight_10_to_14_of_500(&mut a);
+    inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
 
     if let Some(c) = a.inflight_queue.get_mut(12) {
@@ -1193,7 +1257,7 @@ async fn test_assoc_no_congestion_control_t3_probe_duplicates_do_not_widen_the_w
     assert_eq!(tsns(&fast), vec![12]);
     assert_eq!(
         a.inflight_queue.get_num_bytes_to_retransmit(),
-        1000,
+        3500,
         "12 resent by fast retransmission is off the marked set"
     );
 

@@ -2309,6 +2309,28 @@ impl AssociationInternal {
         (chunks, sis_to_reset)
     }
 
+    /// How many packets the chunks marked for retransmission go out in, packed as
+    /// `bundle_data_chunks_into_packets` packs them.
+    fn packets_to_retransmit(&self) -> usize {
+        let mut packets = 0;
+        let mut bytes_in_packet = COMMON_HEADER_SIZE;
+        let mut any = false;
+        let mut tsn = self.cumulative_tsn_ack_point + 1;
+        while let Some(c) = self.inflight_queue.get(tsn) {
+            if c.retransmit && !c.acked && !c.abandoned() {
+                let chunk_size = Self::data_chunk_wire_size(c);
+                if bytes_in_packet + chunk_size > self.mtu {
+                    packets += 1;
+                    bytes_in_packet = COMMON_HEADER_SIZE;
+                }
+                bytes_in_packet += chunk_size;
+                any = true;
+            }
+            tsn += 1;
+        }
+        packets + usize::from(any)
+    }
+
     /// What a DATA chunk adds to a packet: `Packet::marshal` pads every chunk to a 4-byte
     /// boundary, so the bundlers must count that as well as the header, or a bundle of small
     /// chunks lands past the MTU that INITIAL_MTU keeps an IPv6 packet under.
@@ -2782,10 +2804,19 @@ impl RtxTimerObserver for AssociationInternal {
                 );
 
                 self.inflight_queue.mark_all_to_retrasmit();
+                // Everything outstanding fits NO_CC_T3_TAIL_PACKETS packets: a short tail,
+                // lost or merely late, goes out at once, and an early timeout costs no more
+                // than those packets. More than that may be a backlog queued behind a stall,
+                // and one packet probes for the rest (`resolve_t3_withholding`).
                 if self.no_congestion_control {
-                    self.t3_withheld_since = Some(self.send_seq);
-                    self.t3_at = Instant::now();
-                    self.t3_probe_sent = false;
+                    if self.packets_to_retransmit() > NO_CC_T3_TAIL_PACKETS {
+                        self.t3_withheld_since = Some(self.send_seq);
+                        self.t3_at = Instant::now();
+                        self.t3_probe_sent = false;
+                    } else {
+                        // Whatever an earlier timeout withheld is marked afresh and goes out.
+                        self.t3_withheld_since = None;
+                    }
                 }
                 self.awake_write_loop();
             }

@@ -56,11 +56,14 @@ pub(crate) const RTT_VAR_MIN: f64 = 220.0 / 8.0; // msec, dcsctp's 220 after its
 // Without a congestion window every DATA chunk carries the I bit (RFC 7053), so a peer that
 // honours it answers within an RTT and the 200ms delayed-ack budget above no longer applies. A
 // chunk lost at the tail of a burst has nothing sent after it to ack, so its recovery time *is*
-// the RTO, and these floors are KCP's shape: its turbo profile floors RTO at 30ms and the
-// variance term at its 10ms tick, for about srtt + 40ms. 100ms keeps a margin over jitter on top
-// of that. A T3 here resends everything in flight, so the floors stay well clear of an RTT.
-pub(crate) const RTO_MIN_NO_CC: u64 = 100; // msec
-pub(crate) const RTT_VAR_MIN_NO_CC: f64 = 10.0; // msec
+// the RTO, and a T3 there resends one packet and withholds the rest until a SACK says whether
+// the timeout was early (RFC 4960 sec 6.3.3 E3, RFC 5682), so an early one costs a packet. RTO
+// then floors at the KCP turbo profile's 30ms, and the variance term at a quarter of the 25ms
+// QUIC allows the peer to hold an ack (RFC 9002 sec 6.2.1, max_ack_delay), for srtt + 25ms at
+// the least: KCP's srtt + 10ms leaves a link running at the edge of its capacity timing out on
+// its own queueing delay, and every early probe there is a drop.
+pub(crate) const RTO_MIN_NO_CC: u64 = 30; // msec
+pub(crate) const RTT_VAR_MIN_NO_CC: f64 = 6.25; // msec
 pub(crate) const MAX_INIT_RETRANS: usize = 8;
 pub(crate) const PATH_MAX_RETRANS: usize = 5;
 pub(crate) const NO_MAX_RETRANS: usize = 0;

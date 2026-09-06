@@ -97,11 +97,11 @@ mod test_rto_manager {
     async fn test_rto_manager_no_congestion_control_floors() -> Result<()> {
         let mut m = RtoManager::new_no_congestion_control();
         let mut d = RtoManager::new();
-        for _ in 0..8 {
+        for _ in 0..24 {
             m.set_new_rtt(70);
             d.set_new_rtt(70);
         }
-        assert_eq!(m.get_rto(), 110, "srtt + 4 * RTT_VAR_MIN_NO_CC");
+        assert_eq!(m.get_rto(), 95, "srtt + 4 * RTT_VAR_MIN_NO_CC");
         assert_eq!(d.get_rto(), RTO_MIN, "dcsctp's floor binds");
 
         let mut m = RtoManager::new_no_congestion_control();

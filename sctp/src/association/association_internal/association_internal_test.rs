@@ -984,6 +984,236 @@ async fn test_assoc_no_congestion_control_widens_the_window_on_duplicates() -> R
     Ok(())
 }
 
+/// Puts TSN 10..=14 in flight with 500-byte chunks, `sent_seq` == TSN, so two fit a packet.
+fn inflight_10_to_14_of_500(a: &mut AssociationInternal) {
+    a.cumulative_tsn_ack_point = 9;
+    a.my_next_tsn = 15;
+    a.send_seq = 15;
+    a.rwnd = 100_000;
+    for tsn in 10..=14 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            tsn,
+            user_data: Bytes::from(vec![0u8; 500]),
+            nsent: 1,
+            sent_seq: u64::from(tsn),
+            sent_at: at(u64::from(tsn)),
+            ..Default::default()
+        });
+    }
+}
+
+fn tsns(packets: &[Packet]) -> Vec<u32> {
+    packets
+        .iter()
+        .flat_map(|p| p.chunks.iter())
+        .filter_map(|c| c.as_any().downcast_ref::<ChunkPayloadData>().map(|d| d.tsn))
+        .collect()
+}
+
+/// A T3-rtx expiry followed by the write loop's retransmission pass.
+async fn t3_expires(a: &mut AssociationInternal) -> Vec<Packet> {
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    a.get_data_packets_to_retransmit()
+}
+
+// Without a congestion window a T3-rtx resends one packet of the earliest chunks (RFC 4960 sec
+// 6.3.3 E3) and withholds the rest, marked, until a SACK settles them; with one, cwnd does that.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_resends_one_packet() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+
+    let packets = t3_expires(&mut a).await;
+    assert_eq!(packets.len(), 1, "one packet");
+    assert_eq!(
+        tsns(&packets),
+        vec![10, 11],
+        "the earliest that fit the MTU"
+    );
+    assert!(
+        a.get_data_packets_to_retransmit().is_empty(),
+        "the rest wait for a SACK"
+    );
+    assert_eq!(
+        a.inflight_queue.get_num_bytes_to_retransmit(),
+        1500,
+        "marked meanwhile"
+    );
+
+    Ok(())
+}
+
+// A withheld chunk acked means its first transmission arrived: the timeout was early, and the
+// marks come off without a resend.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_early_timeout_resends_nothing_more() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+    t3_expires(&mut a).await;
+
+    sack(&mut a, 9, &[(3, 3)]).await?;
+    assert!(a.t3_withheld_since.is_none(), "12 arrived: settled");
+    assert_eq!(
+        a.inflight_queue.get_num_bytes_to_retransmit(),
+        0,
+        "marks off"
+    );
+    assert!(a.get_data_packets_to_retransmit().is_empty());
+
+    Ok(())
+}
+
+// The probe acked alone says nothing while a first transmission made after the timeout is in
+// flight; that one acked with the withheld chunks still missing is what sends them.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_resends_the_rest_once_later_data_is_acked(
+) -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+    t3_expires(&mut a).await;
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        tsn: 15,
+        user_data: Bytes::from(vec![0u8; 500]),
+        nsent: 1,
+        sent_seq: a.send_seq,
+        sent_at: Instant::now(),
+        ..Default::default()
+    });
+    a.send_seq += 1;
+
+    sack(&mut a, 11, &[]).await?;
+    assert!(
+        a.t3_withheld_since.is_some(),
+        "the probe alone: wait for 15"
+    );
+    assert!(a.get_data_packets_to_retransmit().is_empty());
+
+    sack(&mut a, 11, &[(4, 4)]).await?;
+    assert!(a.t3_withheld_since.is_none(), "15 arrived, 12..=14 did not");
+    assert_eq!(
+        tsns(&a.get_data_packets_to_retransmit()),
+        vec![12, 13, 14],
+        "the rest go out"
+    );
+
+    Ok(())
+}
+
+// On a path seen to reorder, the later data that tells has to have been sent the reordering
+// window after the timeout, or it may only have overtaken the withheld chunks.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_settlement_respects_the_reordering_window(
+) -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+    t3_expires(&mut a).await;
+    a.t3_at = Instant::now() - Duration::from_millis(30);
+    for (tsn, sent_at) in [
+        (15, Instant::now() - Duration::from_millis(20)),
+        (16, Instant::now()),
+    ] {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            tsn,
+            user_data: Bytes::from(vec![0u8; 500]),
+            nsent: 1,
+            sent_seq: a.send_seq,
+            sent_at,
+            ..Default::default()
+        });
+        a.send_seq += 1;
+    }
+
+    a.reo_wnd = Duration::from_millis(25);
+    sack(&mut a, 11, &[(4, 4)]).await?;
+    assert!(
+        a.t3_withheld_since.is_some(),
+        "15 went out 10ms after the timeout, within the window: not yet"
+    );
+
+    a.reo_wnd = Duration::from_millis(25);
+    sack(&mut a, 11, &[(4, 5)]).await?;
+    assert!(a.t3_withheld_since.is_none(), "16 went out past the window");
+    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), vec![12, 13, 14]);
+
+    Ok(())
+}
+
+// With nothing sent after the timeout to draw a telling SACK, the probe's ack is all there will
+// be, and the withheld chunks go out on it.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_resends_the_rest_when_nothing_else_can_tell(
+) -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_14_of_500(&mut a);
+    t3_expires(&mut a).await;
+
+    sack(&mut a, 11, &[]).await?;
+    assert!(a.t3_withheld_since.is_none());
+    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), vec![12, 13, 14]);
+
+    Ok(())
+}
+
+// A chunk fast retransmission resends is no longer withheld, and a duplicate report for the
+// probe's TSN does not open the reordering window.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_probe_duplicates_do_not_widen_the_window() -> Result<()>
+{
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.rto_mgr.srtt = 40;
+    a.rto_mgr.no_update = true;
+    inflight_10_to_14_of_500(&mut a);
+    t3_expires(&mut a).await;
+
+    if let Some(c) = a.inflight_queue.get_mut(12) {
+        c.miss_indicator = 3;
+    }
+    a.will_retransmit_fast = true;
+    let fast = a.gather_outbound_fast_retransmission_packets(vec![]);
+    assert_eq!(tsns(&fast), vec![12]);
+    assert_eq!(
+        a.inflight_queue.get_num_bytes_to_retransmit(),
+        1000,
+        "12 resent by fast retransmission is off the marked set"
+    );
+
+    sack_with_dups(&mut a, 11, &[], &[10, 11]).await?;
+    assert_eq!(a.reo_wnd_mult, 0, "the probe's own duplicates");
+    sack_with_dups(&mut a, 11, &[], &[12]).await?;
+    assert_eq!(a.reo_wnd_mult, 1, "any other duplicate counts");
+
+    Ok(())
+}
+
+// A T3-rtx restarted by a SACK is timed from the latest send without a congestion window, and
+// from the SACK with one.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_restart_counts_from_the_latest_send() -> Result<()> {
+    for nocc in [false, true] {
+        let mut a = create_client_association_internal();
+        a.no_congestion_control = nocc;
+        a.rto_mgr.set_rto(100, true);
+        a.last_send_at = Instant::now() - Duration::from_millis(60);
+        let rto = a.t3_rto_from_latest_send();
+        if nocc {
+            assert!(
+                (38..=42).contains(&rto),
+                "nocc: 100 less the 60 since the latest send, got {rto}"
+            );
+        } else {
+            assert_eq!(rto, 100, "cc: the RTO as it is");
+        }
+    }
+
+    Ok(())
+}
+
 // Without a congestion window every chunk asks for its SACK at once (RFC 7053), on the wire and
 // on the copy kept for retransmission; with one, the peer's delayed ack is left alone.
 #[tokio::test]

@@ -84,6 +84,19 @@ pub struct AssociationInternal {
     pub(crate) reo_wnd_seen_at: Option<Instant>,
     /// Last duplicate report; 16 srtt after it the window is back to one quarter.
     pub(crate) reo_wnd_dup_at: Option<Instant>,
+    /// Set by a T3-rtx without a congestion window: the send-order stamp at the timeout. The
+    /// chunks it marked stay stamped below it while they are withheld; the probe and anything
+    /// sent since are stamped above. `None` once `resolve_t3_withholding` has settled them.
+    pub(crate) t3_withheld_since: Option<u64>,
+    /// When that timeout fired.
+    pub(crate) t3_at: Instant,
+    t3_probe_sent: bool,
+    /// TSNs the last T3 probe carried: a duplicate report for one of them says the timeout was
+    /// early, not that the path reorders.
+    t3_probe_tsns: Vec<u32>,
+    /// When the latest DATA chunk went out, first transmission or not; a T3-rtx restarted by a
+    /// SACK is counted from there.
+    pub(crate) last_send_at: Instant,
 
     // RTX & Ack timer
     pub(crate) rto_mgr: RtoManager,
@@ -207,6 +220,11 @@ impl AssociationInternal {
             reo_wnd_grown_at: None,
             reo_wnd_seen_at: None,
             reo_wnd_dup_at: None,
+            t3_withheld_since: None,
+            t3_at: Instant::now(),
+            t3_probe_sent: false,
+            t3_probe_tsns: vec![],
+            last_send_at: Instant::now(),
 
             rto_mgr: if no_cc {
                 RtoManager::new_no_congestion_control()
@@ -535,7 +553,10 @@ impl AssociationInternal {
                         c.sent_seq = self.send_seq;
                         c.sent_at = Instant::now();
                         self.send_seq += 1;
+                        self.last_send_at = c.sent_at;
                         c.miss_indicator = 0;
+                        // A T3-rtx may have marked it too; resent here, it is not withheld.
+                        c.retransmit = false;
                     }
                 } else {
                     break; // end of pending data
@@ -1173,7 +1194,11 @@ impl AssociationInternal {
         &mut self,
         d: &ChunkSelectiveAck,
     ) -> Result<(HashMap<u16, i64>, u32)> {
-        if self.no_congestion_control && !d.duplicate_tsn.is_empty() {
+        if self.no_congestion_control
+            && d.duplicate_tsn
+                .iter()
+                .any(|tsn| !self.t3_probe_tsns.contains(tsn))
+        {
             self.note_spurious_retransmission();
         }
         let mut bytes_acked_per_stream = HashMap::new();
@@ -1323,8 +1348,9 @@ impl AssociationInternal {
             }
         } else {
             log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
+            let rto = self.t3_rto_from_latest_send();
             if let Some(t3rtx) = &self.t3rtx {
-                t3rtx.start(self.rto_mgr.get_rto()).await;
+                t3rtx.start(rto).await;
             }
         }
 
@@ -1513,6 +1539,58 @@ impl AssociationInternal {
         self.reo_wnd_dup_at = Some(now);
     }
 
+    /// The interval for a T3-rtx restarted by a SACK. Without a congestion window it is RTO
+    /// counted from the latest send, as QUIC arms its probe timeout (RFC 9002 sec 6.2), rather
+    /// than RTO from the SACK: a chunk lost at the tail of a stream is that latest send, so it
+    /// times out RTO after it went out, not RTO after the ack of the chunk before it. While
+    /// sends go on, the latest is recent and the interval is the RTO as before. Not the
+    /// earliest chunk's send: after a stall every chunk in the backlog is older than the RTO,
+    /// and that would fire a probe per SACK until the backlog is acked.
+    fn t3_rto_from_latest_send(&self) -> u64 {
+        let rto = self.rto_mgr.get_rto();
+        if !self.no_congestion_control {
+            return rto;
+        }
+        let age = self.last_send_at.elapsed().as_millis() as u64;
+        rto.saturating_sub(age).max(1)
+    }
+
+    /// The chunks a T3-rtx marked and withheld, settled by this SACK as RFC 5682 (F-RTO)
+    /// settles a timeout. One of them acked: its first transmission arrived after all, so the
+    /// timeout was early and the marks come off - a chunk lost among them is found by the acks
+    /// of what follows it, as any other. A first transmission made after the timeout acked
+    /// while they are not: they are lost, and go out as RFC 4960 sec 6.3.3 has them, now that
+    /// a SACK is in - a first transmission made the reordering window after the timeout, so
+    /// that on a path that reorders it cannot merely have overtaken them. The probe acked and
+    /// nothing else says nothing, since a SACK does not tell the original from the resend; the
+    /// next SACK does, unless nothing sent after the timeout is left to draw one, in which
+    /// case the marked chunks go out as F-RTO falls back to.
+    fn resolve_t3_withholding(&mut self) {
+        let Some(since) = self.t3_withheld_since else {
+            return;
+        };
+        if self.inflight_queue.get_num_bytes_to_retransmit() == 0 {
+            self.t3_withheld_since = None;
+            return;
+        }
+        let withheld_acked = self.sacked_sends.iter().any(|&(s, _, _)| s < since);
+        let after_window = self.t3_at + self.reo_wnd;
+        let later_first_acked = self
+            .sacked_sends
+            .iter()
+            .any(|&(s, at, first)| s >= since && first && at >= after_window);
+        if withheld_acked {
+            self.inflight_queue.unmark_all_to_retransmit();
+            self.t3_withheld_since = None;
+        } else if later_first_acked
+            || (!self.sacked_sends.is_empty()
+                && !self.inflight_queue.has_first_transmission_since(since))
+        {
+            self.t3_withheld_since = None;
+            self.awake_write_loop();
+        }
+    }
+
     /// Loss detection when nothing waits on cwnd: a chunk is lost once three chunks sent after
     /// its latest transmission, and at least the reordering window after it, have been acked.
     /// That is RFC 6675's DupThresh counted in send order rather than TSN order, so it applies
@@ -1528,6 +1606,7 @@ impl AssociationInternal {
     /// after the chunk - a frame's worth, at 30 frames/s on a 70ms path - and each round of
     /// duplicates the receiver reports widens that by another quarter.
     fn process_fast_retransmission_nocc(&mut self, cum_tsn_ack_point: u32) -> Result<()> {
+        self.resolve_t3_withholding();
         // Reordering this SACK shows: a first transmission acked behind one sent after it. Only
         // first transmissions can tell, since a SACK does not say which transmission of a resent
         // chunk arrived; and chunks acked by one SACK count as arriving together.
@@ -1732,8 +1811,9 @@ impl AssociationInternal {
         if !self.inflight_queue.is_empty() {
             // Start timer. (noop if already started)
             log::trace!("[{}] T3-rtx timer start (pt3)", self.name);
+            let rto = self.t3_rto_from_latest_send();
             if let Some(t3rtx) = &self.t3rtx {
-                t3rtx.start(self.rto_mgr.get_rto()).await;
+                t3rtx.start(rto).await;
             }
         } else if state == AssociationState::ShutdownPending {
             // No more outstanding, send shutdown.
@@ -2098,6 +2178,7 @@ impl AssociationInternal {
             c.sent_seq = self.send_seq;
             c.sent_at = Instant::now();
             self.send_seq += 1;
+            self.last_send_at = c.sent_at;
             // RFC 7053: ask for the SACK at once. With no congestion window the RTO floors are
             // sized for a peer that answers within an RTT, not one holding a delayed ack for
             // 200ms; and a SACK per packet is what the loss detection counts. Set on the copy
@@ -2318,6 +2399,14 @@ impl AssociationInternal {
         let mut done = false;
         let mut i = 0;
         let nocc = self.no_congestion_control;
+        // RFC 4960 sec 6.3.3 E3 without a congestion window: the timeout resends one packet of
+        // the earliest chunks, and the rest wait, marked, for `resolve_t3_withholding`. With
+        // one, cwnd at one MTU has the same effect.
+        let probe = nocc && self.t3_withheld_since.is_some();
+        if probe && self.t3_probe_sent {
+            return vec![];
+        }
+        let mut probe_size = COMMON_HEADER_SIZE;
         while !done {
             let tsn = self.cumulative_tsn_ack_point + i + 1;
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
@@ -2331,7 +2420,10 @@ impl AssociationInternal {
                     done = true;
                 } else if bytes_to_send + c.user_data.len() > awnd as usize {
                     break;
+                } else if probe && probe_size + Self::data_chunk_wire_size(c) > self.mtu {
+                    break;
                 }
+                probe_size += Self::data_chunk_wire_size(c);
 
                 // reset the retransmit flag not to retransmit again before the next
                 // t3-rtx timer fires
@@ -2343,6 +2435,7 @@ impl AssociationInternal {
                     c.sent_seq = self.send_seq;
                     c.sent_at = Instant::now();
                     self.send_seq += 1;
+                    self.last_send_at = c.sent_at;
                     c.miss_indicator = 0;
                 }
             } else {
@@ -2365,6 +2458,10 @@ impl AssociationInternal {
             i += 1;
         }
 
+        if probe {
+            self.t3_probe_sent = true;
+            self.t3_probe_tsns = chunks.iter().map(|c| c.tsn).collect();
+        }
         self.bundle_data_chunks_into_packets(chunks)
     }
 
@@ -2665,6 +2762,11 @@ impl RtxTimerObserver for AssociationInternal {
                 );
 
                 self.inflight_queue.mark_all_to_retrasmit();
+                if self.no_congestion_control {
+                    self.t3_withheld_since = Some(self.send_seq);
+                    self.t3_at = Instant::now();
+                    self.t3_probe_sent = false;
+                }
                 self.awake_write_loop();
             }
 

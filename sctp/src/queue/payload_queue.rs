@@ -173,6 +173,19 @@ impl PayloadQueue {
         self.n_bytes
     }
 
+    pub(crate) fn unmark_all_to_retransmit(&mut self) {
+        for c in self.chunk_map.values_mut() {
+            c.retransmit = false;
+        }
+    }
+
+    /// Whether a chunk first sent at or after send-order stamp `seq` is still unacked.
+    pub(crate) fn has_first_transmission_since(&self, seq: u64) -> bool {
+        self.chunk_map
+            .values()
+            .any(|c| !c.acked && !c.abandoned() && c.nsent == 1 && c.sent_seq >= seq)
+    }
+
     pub(crate) fn get_num_bytes_to_retransmit(&self) -> usize {
         self.chunk_map
             .values()

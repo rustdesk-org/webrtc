@@ -1149,11 +1149,25 @@ async fn test_assoc_no_congestion_control_t3_resends_the_rest_when_nothing_else_
 ) -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
+    a.min_rtt = Some(70);
     inflight_10_to_14_of_500(&mut a);
     t3_expires(&mut a).await;
 
+    // A SACK for the probe's TSN right after the probe went out is the original arriving
+    // from behind the timeout, and says nothing about the rest.
     sack(&mut a, 11, &[]).await?;
-    assert!(a.t3_withheld_since.is_none());
+    assert!(a.t3_withheld_since.is_some(), "sooner than an RTT: the original");
+    assert!(a.get_data_packets_to_retransmit().is_empty());
+
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.min_rtt = Some(70);
+    inflight_10_to_14_of_500(&mut a);
+    t3_expires(&mut a).await;
+    a.t3_probe_sent_at = Instant::now() - Duration::from_millis(70);
+
+    sack(&mut a, 11, &[]).await?;
+    assert!(a.t3_withheld_since.is_none(), "an RTT later: the probe's own ack");
     assert_eq!(tsns(&a.get_data_packets_to_retransmit()), vec![12, 13, 14]);
 
     Ok(())

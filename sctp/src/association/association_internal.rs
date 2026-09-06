@@ -91,6 +91,11 @@ pub struct AssociationInternal {
     /// When that timeout fired.
     pub(crate) t3_at: Instant,
     t3_probe_sent: bool,
+    /// When the probe went out: a SACK for its TSN sooner than half the least RTT after that
+    /// can only be the original's.
+    pub(crate) t3_probe_sent_at: Instant,
+    /// The least RTT sampled, ms.
+    pub(crate) min_rtt: Option<u64>,
     /// TSNs the last T3 probe carried: a duplicate report for one of them says the timeout was
     /// early, not that the path reorders.
     t3_probe_tsns: Vec<u32>,
@@ -223,6 +228,8 @@ impl AssociationInternal {
             t3_withheld_since: None,
             t3_at: Instant::now(),
             t3_probe_sent: false,
+            t3_probe_sent_at: Instant::now(),
+            min_rtt: None,
             t3_probe_tsns: vec![],
             last_send_at: Instant::now(),
 
@@ -1251,6 +1258,7 @@ impl AssociationInternal {
                             Err(_) => return Err(Error::ErrInvalidSystemTime),
                         };
                         let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
+                        self.note_min_rtt(rtt.as_millis() as u64);
                         log::trace!(
                             "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
                             self.name,
@@ -1311,6 +1319,7 @@ impl AssociationInternal {
                                 Err(_) => return Err(Error::ErrInvalidSystemTime),
                             };
                             let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
+                            self.note_min_rtt(rtt.as_millis() as u64);
                             log::trace!(
                                 "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
                                 self.name,
@@ -1555,6 +1564,10 @@ impl AssociationInternal {
         rto.saturating_sub(age).max(1)
     }
 
+    fn note_min_rtt(&mut self, rtt: u64) {
+        self.min_rtt = Some(self.min_rtt.map_or(rtt, |m| m.min(rtt)));
+    }
+
     /// The chunks a T3-rtx marked and withheld, settled by this SACK as RFC 5682 (F-RTO)
     /// settles a timeout. One of them acked: its first transmission arrived after all, so the
     /// timeout was early and the marks come off - a chunk lost among them is found by the acks
@@ -1564,7 +1577,10 @@ impl AssociationInternal {
     /// that on a path that reorders it cannot merely have overtaken them. The probe acked and
     /// nothing else says nothing, since a SACK does not tell the original from the resend; the
     /// next SACK does, unless nothing sent after the timeout is left to draw one, in which
-    /// case the marked chunks go out as F-RTO falls back to.
+    /// case the marked chunks go out as F-RTO falls back to - but only once the probe has
+    /// been out for half the least RTT, since a SACK sooner than that is the original's, as
+    /// RACK (RFC 8985 sec 6.1) tells the two apart: a burst still draining from a slow link
+    /// acks the originals one after another, and none of them says the rest were lost.
     fn resolve_t3_withholding(&mut self) {
         let Some(since) = self.t3_withheld_since else {
             return;
@@ -1584,7 +1600,10 @@ impl AssociationInternal {
             self.t3_withheld_since = None;
         } else if later_first_acked
             || (!self.sacked_sends.is_empty()
-                && !self.inflight_queue.has_first_transmission_since(since))
+                && !self.inflight_queue.has_first_transmission_since(since)
+                && self.t3_probe_sent
+                && self.t3_probe_sent_at.elapsed().as_millis() as u64 * 2
+                    >= self.min_rtt.unwrap_or(0))
         {
             self.t3_withheld_since = None;
             self.awake_write_loop();
@@ -2460,6 +2479,7 @@ impl AssociationInternal {
 
         if probe {
             self.t3_probe_sent = true;
+            self.t3_probe_sent_at = Instant::now();
             self.t3_probe_tsns = chunks.iter().map(|c| c.tsn).collect();
         }
         self.bundle_data_chunks_into_packets(chunks)

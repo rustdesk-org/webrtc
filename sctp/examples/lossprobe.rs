@@ -20,7 +20,7 @@
 //! DIP_EVERY=0 DIP_MS=0 DIP_RATE=1  the link runs at DIP_RATE Mbps for DIP_MS every DIP_EVERY ms
 //! FRAME=12000 FPS=30 FRAMES=300     the workload: FRAMES frames of FRAME bytes at FPS
 //! GAP_EVERY=0 GAP_MS=0              pause GAP_MS after every GAP_EVERY frames: bursts with tails
-//! TAILDROP=0                        drop the last TAILDROP packets of every burst
+//! TAILDROP=0                        drop the last TAILDROP packets of every burst's last frame
 //! SEED=1 DEADLINE=60
 //! ```
 //!
@@ -171,8 +171,10 @@ struct Impair {
     dip_every: Duration,
     dip_len: Duration,
     dip_rate_mbps: f64,
-    /// Packets still to drop on the workload's order, for a controlled tail loss.
+    /// Packets still to drop on the workload's order, for a controlled tail loss, once
+    /// `drop_skip` more have passed.
     drop_next: Arc<AtomicU64>,
+    drop_skip: Arc<AtomicU64>,
     trace: Arc<PathTrace>,
 }
 
@@ -230,8 +232,13 @@ fn pipe(
                         } else {
                             bad
                         };
-                        let forced = im.drop_next.load(Ordering::Relaxed) > 0
-                            && im.drop_next.fetch_sub(1, Ordering::Relaxed) > 0;
+                        let forced = if im.drop_skip.load(Ordering::Relaxed) > 0 {
+                            im.drop_skip.fetch_sub(1, Ordering::Relaxed);
+                            false
+                        } else {
+                            im.drop_next.load(Ordering::Relaxed) > 0
+                                && im.drop_next.fetch_sub(1, Ordering::Relaxed) > 0
+                        };
                         if impaired && (lost || forced) {
                             stats.dropped.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -305,6 +312,7 @@ struct Link {
     dip_rate: f64,
     trace_ticks: usize,
     drop_next: Arc<AtomicU64>,
+    drop_skip: Arc<AtomicU64>,
     loss_on: Arc<AtomicBool>,
     ab: Arc<LinkStats>,
     ba: Arc<LinkStats>,
@@ -333,6 +341,11 @@ impl Link {
                 Arc::default()
             } else {
                 self.drop_next.clone()
+            },
+            drop_skip: if rev {
+                Arc::default()
+            } else {
+                self.drop_skip.clone()
             },
             trace: Arc::new(PathTrace::new(
                 seed,
@@ -426,16 +439,23 @@ struct Workload {
 }
 
 impl Workload {
-    /// When to send frame `i` next, and whether the tail drop should be armed before it.
-    fn step(&self, i: usize, next: &mut Instant, drop_next: &AtomicU64) {
+    /// When to send frame `i` next, and the tail drop to arm before it: a frame of several
+    /// packets loses its own last packets, frames of one packet lose the last frames.
+    fn step(&self, i: usize, next: &mut Instant, drop_next: &AtomicU64, drop_skip: &AtomicU64) {
         *next += self.interval;
         if self.gap_every > 0 && (i + 1) % self.gap_every == 0 {
             *next += self.gap;
         }
-        if self.tail_drop > 0
-            && self.gap_every > 0
-            && i % self.gap_every == self.gap_every - self.tail_drop as usize
-        {
+        if self.tail_drop == 0 || self.gap_every == 0 {
+            return;
+        }
+        let packets = (self.frame.max(1) as u64).div_ceil(1160);
+        if packets >= self.tail_drop {
+            if (i + 1) % self.gap_every == 0 {
+                drop_skip.store(packets - self.tail_drop, Ordering::Relaxed);
+                drop_next.store(self.tail_drop, Ordering::Relaxed);
+            }
+        } else if i % self.gap_every == self.gap_every - self.tail_drop as usize {
             drop_next.store(self.tail_drop, Ordering::Relaxed);
         }
     }
@@ -533,7 +553,7 @@ async fn run_sctp(w: &Workload, link: &Link, nc: bool) -> Report {
         }
         start.elapsed()
     });
-    let (frame, drop_next) = (w.frame, link.drop_next.clone());
+    let (frame, drop_next, drop_skip) = (w.frame, link.drop_next.clone(), link.drop_skip.clone());
     let w = w.clone();
     let deadline = w.deadline;
     tokio::spawn(async move {
@@ -541,7 +561,7 @@ async fn run_sctp(w: &Workload, link: &Link, nc: bool) -> Report {
         for i in 0..frames {
             tokio::time::sleep_until(next).await;
             let f = frame_bytes(start, next, frame);
-            w.step(i, &mut next, &drop_next);
+            w.step(i, &mut next, &drop_next, &drop_skip);
             // As RustDesk fragments a message for the data channel's 64 KiB limit.
             for piece in f.chunks(60000) {
                 s0.write_sctp(
@@ -655,7 +675,7 @@ async fn run_kcp(w: &Workload, link: &Link, nc: bool) -> Report {
         }
         start.elapsed()
     });
-    let (frame, drop_next) = (w.frame, link.drop_next.clone());
+    let (frame, drop_next, drop_skip) = (w.frame, link.drop_next.clone(), link.drop_skip.clone());
     let w = w.clone();
     let deadline = w.deadline;
     tokio::spawn(async move {
@@ -663,7 +683,7 @@ async fn run_kcp(w: &Workload, link: &Link, nc: bool) -> Report {
         for i in 0..frames {
             tokio::time::sleep_until(next).await;
             let f = frame_bytes(start, next, frame);
-            w.step(i, &mut next, &drop_next);
+            w.step(i, &mut next, &drop_next, &drop_skip);
             let mut framed = BytesMut::with_capacity(4 + f.len());
             framed.put_u32(f.len() as u32);
             framed.put_slice(&f);
@@ -727,6 +747,7 @@ async fn main() {
         dip_rate: env_u64("DIP_RATE", 1) as f64,
         trace_ticks: (w.deadline.as_millis() as usize) + 10_000,
         drop_next: Arc::default(),
+        drop_skip: Arc::default(),
         loss_on: Arc::new(AtomicBool::new(false)),
         ab: Arc::new(LinkStats::default()),
         ba: Arc::new(LinkStats::default()),

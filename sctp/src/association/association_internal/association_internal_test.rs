@@ -1260,6 +1260,41 @@ async fn test_assoc_no_congestion_control_t3_probes_twice_when_nothing_else_can_
     Ok(())
 }
 
+// Only the probe's own ack confirms it: a first transmission made after the timeout and acked
+// within the reordering window says nothing, and neither draws a probe nor counts as one.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_probe_confirmation_needs_the_probe_acked(
+) -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.min_rtt = Some(70);
+    inflight_10_to_19_of_500(&mut a);
+    t3_expires(&mut a).await;
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        tsn: 20,
+        user_data: Bytes::from(vec![0u8; 500]),
+        nsent: 1,
+        sent_seq: a.send_seq,
+        sent_at: Instant::now(),
+        ..Default::default()
+    });
+    a.send_seq += 1;
+    a.t3_probe_sent_at = Instant::now() - Duration::from_millis(70);
+
+    a.reo_wnd = Duration::from_millis(50);
+    sack(&mut a, 9, &[(11, 11)]).await?;
+    assert!(a.t3_withheld_since.is_some(), "20 within the window: unsettled");
+    assert_eq!(a.t3_probes_confirmed, 0, "and no probe confirmed by it");
+    assert!(a.get_data_packets_to_retransmit().is_empty(), "no new probe");
+
+    a.reo_wnd = Duration::from_millis(50);
+    sack(&mut a, 11, &[(9, 9)]).await?;
+    assert_eq!(a.t3_probes_confirmed, 1, "the probe's own ack");
+    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), vec![12, 13]);
+
+    Ok(())
+}
+
 // Exactly NO_CC_T3_TAIL_PACKETS packets' worth goes out at once; one packet more is probed.
 #[tokio::test]
 async fn test_assoc_no_congestion_control_t3_tail_bound_is_four_packets() -> Result<()> {

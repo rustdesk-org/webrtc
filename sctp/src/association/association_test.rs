@@ -2862,6 +2862,49 @@ async fn test_assoc_no_congestion_control_caps_fast_retransmissions() -> Result<
 // recovery. Without a congestion window the chunk before it asked for its SACK at once, so the
 // timer restarts within an RTT rather than after the peer's 200ms delayed ack, and the RTO
 // floor is 100ms rather than 400: the tail is back in about 100ms, where it took 600.
+// With nothing coming back, the timeout's own probes are spaced RTO, 2 RTO, 4 RTO: three in
+// 750ms at an RTO of 100, not seven.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_backs_off_while_probing() -> Result<()> {
+    const SI: u16 = 6;
+    let sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+    let (s0, _s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.rto_mgr.set_rto(100, true);
+        a.stats.reset();
+    }
+
+    // Six packets, more than a timeout resends at once, and every packet from here on lost.
+    br.drop_next_nwrites(0, 1000);
+    for _ in 0..6 {
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(750) {
+        br.tick().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(
+            a.stats.get_num_t3timeouts(),
+            3,
+            "T3-rtx at 100, 300 and 700ms"
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_assoc_no_congestion_control_recovers_a_tail_loss_fast() -> Result<()> {
     const SI: u16 = 6;

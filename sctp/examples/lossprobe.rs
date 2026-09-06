@@ -434,7 +434,7 @@ impl Workload {
         }
         if self.tail_drop > 0
             && self.gap_every > 0
-            && (i + 1) % self.gap_every == self.gap_every - self.tail_drop as usize
+            && i % self.gap_every == self.gap_every - self.tail_drop as usize
         {
             drop_next.store(self.tail_drop, Ordering::Relaxed);
         }

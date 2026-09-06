@@ -1357,9 +1357,9 @@ impl AssociationInternal {
             }
         } else {
             log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
-            let rto = self.t3_rto_from_latest_send();
+            let first = self.t3_rto_from_latest_send();
             if let Some(t3rtx) = &self.t3rtx {
-                t3rtx.start(rto).await;
+                t3rtx.start_after(first, self.rto_mgr.get_rto()).await;
             }
         }
 
@@ -1830,9 +1830,9 @@ impl AssociationInternal {
         if !self.inflight_queue.is_empty() {
             // Start timer. (noop if already started)
             log::trace!("[{}] T3-rtx timer start (pt3)", self.name);
-            let rto = self.t3_rto_from_latest_send();
+            let first = self.t3_rto_from_latest_send();
             if let Some(t3rtx) = &self.t3rtx {
-                t3rtx.start(rto).await;
+                t3rtx.start_after(first, self.rto_mgr.get_rto()).await;
             }
         } else if state == AssociationState::ShutdownPending {
             // No more outstanding, send shutdown.

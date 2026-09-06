@@ -270,6 +270,28 @@ mod test_rtx_timer {
         Ok(())
     }
 
+    // A shorter first interval, then the RTO doubled: 10, 210, 610 within 650ms - not the
+    // first interval doubled, which would be 10, 30, 70, 150, 310, 630.
+    #[tokio::test]
+    async fn test_rtx_timer_backs_off_from_the_rto_after_a_shorter_first() -> Result<()> {
+        let timer_id = RtxTimerId::T3RTX;
+        let ncbs = Arc::new(AtomicU32::new(0));
+        let obs = Arc::new(Mutex::new(TestTimerObserver {
+            ncbs: ncbs.clone(),
+            timer_id,
+            ..Default::default()
+        }));
+        let rt = RtxTimer::new(Arc::downgrade(&obs), timer_id, PATH_MAX_RETRANS);
+
+        assert!(rt.start_after(10, 100).await);
+        sleep(Duration::from_millis(650)).await;
+        rt.stop().await;
+
+        assert_eq!(ncbs.load(Ordering::SeqCst), 3, "10, 210, 610");
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_rtx_timer_last_start_wins() -> Result<()> {
         let timer_id = RtxTimerId::T3RTX;

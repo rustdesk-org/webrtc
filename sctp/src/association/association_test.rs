@@ -2889,7 +2889,7 @@ async fn test_assoc_no_congestion_control_t3_backs_off_while_probing() -> Result
         .await?;
     }
     let start = tokio::time::Instant::now();
-    while start.elapsed() < Duration::from_millis(750) {
+    while start.elapsed() < Duration::from_millis(900) {
         br.tick().await;
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -2898,9 +2898,100 @@ async fn test_assoc_no_congestion_control_t3_backs_off_while_probing() -> Result
         assert_eq!(
             a.stats.get_num_t3timeouts(),
             3,
-            "T3-rtx at 100, 300 and 700ms"
+            "T3-rtx at 100, 300 and 700ms; the fourth at 1500"
         );
     }
+
+    Ok(())
+}
+
+/// Ticks the bridge until queue `id` holds `n` packets, or 200ms pass.
+async fn wait_queued(br: &Arc<Bridge>, id: usize, n: usize) {
+    for _ in 0..200 {
+        if br.len(id).await >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+// Six packets lost, the peer 70ms away: the timeout's probe is acked at t+170, draws the
+// second probe, acked at t+240, which settles the rest as lost and sends them. That resend is
+// a SACK's doing, so T3-rtx runs from it: no timeout before their acks can be back.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_bulk_resend_restarts_t3rtx() -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    {
+        let mut a = a0.association_internal.lock().await;
+        a.no_congestion_control = true;
+        a.rto_mgr.set_rto(100, true);
+        a.min_rtt = Some(70);
+        a.stats.reset();
+    }
+
+    let t0 = tokio::time::Instant::now();
+    br.drop_next_nwrites(0, 6);
+    for i in 0..6u32 {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+
+    // t+100: the timeout's probe. Delivered at once; its SACK held until t+170.
+    tokio::time::sleep_until(t0 + Duration::from_millis(100)).await;
+    wait_queued(&br, 0, 1).await;
+    assert_eq!(br.len(0).await, 1, "one probe");
+    br.tick().await;
+    wait_queued(&br, 1, 1).await;
+    tokio::time::sleep_until(t0 + Duration::from_millis(170)).await;
+    br.tick().await;
+
+    // Its ack draws the second probe; its SACK held until t+240.
+    wait_queued(&br, 0, 1).await;
+    assert_eq!(br.len(0).await, 1, "the second probe");
+    br.tick().await;
+    wait_queued(&br, 1, 1).await;
+    tokio::time::sleep_until(t0 + Duration::from_millis(240)).await;
+    br.tick().await;
+
+    // Two probes confirmed: the rest go out, and T3-rtx must run from that send.
+    wait_queued(&br, 0, 4).await;
+    assert_eq!(br.len(0).await, 4, "the four withheld chunks resent at once");
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_t3timeouts(), 1, "one timeout so far");
+    }
+    tokio::time::sleep_until(t0 + Duration::from_millis(300)).await;
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(
+            a.stats.get_num_t3timeouts(),
+            1,
+            "T3-rtx fired again before the resend could be acked"
+        );
+    }
+
+    br.process().await;
+    let mut buf = vec![0u8; 3000];
+    for i in 0..6u32 {
+        let (n, _) = s1.read_sctp(&mut buf).await?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i,
+            "unexpected received data"
+        );
+    }
+
+    close_association_pair(&br, a0, a1).await;
 
     Ok(())
 }

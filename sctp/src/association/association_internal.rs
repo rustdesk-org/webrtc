@@ -94,9 +94,11 @@ pub struct AssociationInternal {
     /// The send-order stamps of the latest probe's chunks, so a SACK is known to have acked
     /// the probe itself and not something else sent since the timeout.
     t3_probe_seqs: (u64, u64),
-    /// Whether the next probe is one a SACK drew, which restarts T3-rtx from its own send;
-    /// the timeout's own probe leaves the timer to its backoff.
-    t3_probe_restarts_timer: bool,
+    /// Whether the next retransmission is one a SACK drew - the next probe, or the withheld
+    /// chunks settled as lost - which restarts T3-rtx from its own send; the timeout's own
+    /// retransmissions leave the timer to its backoff. One-shot: the next pass of the write
+    /// loop consumes it, packets or not.
+    t3_retransmit_restarts_timer: bool,
     /// When the latest probe went out: a SACK for its TSN sooner than the least RTT after
     /// that can only be the original's.
     pub(crate) t3_probe_sent_at: Instant,
@@ -238,7 +240,7 @@ impl AssociationInternal {
             t3_at: Instant::now(),
             t3_probe_sent: false,
             t3_probe_seqs: (0, 0),
-            t3_probe_restarts_timer: false,
+            t3_retransmit_restarts_timer: false,
             t3_probe_sent_at: Instant::now(),
             t3_probes_confirmed: 0,
             min_rtt: None,
@@ -1509,23 +1511,22 @@ impl AssociationInternal {
         Ok(())
     }
 
-    /// The timeout's retransmissions, and the T3-rtx restart a probe a SACK drew calls for
-    /// without a congestion window: it goes out after that SACK restarted the timer from the
-    /// previous send, with little of the RTO left, and the timer would fire again before the
-    /// probe's ack could arrive; so, as a fast retransmission of the earliest chunk does, it
-    /// restarts T3-rtx from its own send. The timeout's own probe leaves the timer to its
-    /// backoff, so an outage is probed at RTO, 2 RTO, 4 RTO, not at every RTO.
+    /// The timeout's retransmissions, and the T3-rtx restart a retransmission a SACK drew
+    /// calls for without a congestion window - the next probe, or the withheld chunks settled
+    /// as lost: it goes out after that SACK restarted the timer from the previous send, with
+    /// little of the RTO left, and the timer would fire again before its ack could arrive;
+    /// so, as a fast retransmission of the earliest chunk does, it restarts T3-rtx from its
+    /// own send. The timeout's own retransmissions leave the timer to its backoff, so an
+    /// outage is probed at RTO, 2 RTO, 4 RTO, not at every RTO.
     async fn gather_data_packets_to_retransmit_restarting_t3rtx(
         &mut self,
         mut raw_packets: Vec<Packet>,
     ) -> Vec<Packet> {
         let before = raw_packets.len();
+        let restart = self.t3_retransmit_restarts_timer;
+        self.t3_retransmit_restarts_timer = false;
         raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
-        if self.no_congestion_control
-            && self.t3_probe_restarts_timer
-            && raw_packets.len() > before
-        {
-            self.t3_probe_restarts_timer = false;
+        if self.no_congestion_control && restart && raw_packets.len() > before {
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.stop().await;
                 t3rtx.start(self.rto_mgr.get_rto()).await;
@@ -1632,6 +1633,7 @@ impl AssociationInternal {
         };
         if self.inflight_queue.get_num_bytes_to_retransmit() == 0 {
             self.t3_withheld_since = None;
+            self.t3_retransmit_restarts_timer = false;
             return;
         }
         let withheld_acked = self.sacked_sends.iter().any(|&(s, _, _)| s < since);
@@ -1649,10 +1651,10 @@ impl AssociationInternal {
         if withheld_acked {
             self.inflight_queue.unmark_all_to_retransmit();
             self.t3_withheld_since = None;
-            self.t3_probe_restarts_timer = false;
+            self.t3_retransmit_restarts_timer = false;
         } else if later_first_acked {
             self.t3_withheld_since = None;
-            self.t3_probe_restarts_timer = false;
+            self.t3_retransmit_restarts_timer = true;
             self.awake_write_loop();
         } else if latest_probe_acked {
             let Some(min_rtt) = self.min_rtt else {
@@ -1667,8 +1669,8 @@ impl AssociationInternal {
                 self.t3_withheld_since = None;
             } else {
                 self.t3_probe_sent = false;
-                self.t3_probe_restarts_timer = true;
             }
+            self.t3_retransmit_restarts_timer = true;
             self.awake_write_loop();
         }
     }
@@ -2878,13 +2880,13 @@ impl RtxTimerObserver for AssociationInternal {
                         self.t3_withheld_since = Some(self.send_seq);
                         self.t3_at = Instant::now();
                         self.t3_probe_sent = false;
-                        self.t3_probe_restarts_timer = false;
                         self.t3_probes_confirmed = 0;
                         self.t3_probe_tsns.clear();
                     } else {
                         // Whatever an earlier timeout withheld is marked afresh and goes out.
                         self.t3_withheld_since = None;
                     }
+                    self.t3_retransmit_restarts_timer = false;
                 }
                 self.awake_write_loop();
             }

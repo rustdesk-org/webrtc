@@ -32,6 +32,11 @@ async-trait = "0.1"
 log = "0.4"
 thiserror = "1"
 portable-atomic = "1.6"
+kcp-sys = { git = "https://github.com/rustdesk-org/kcp-sys", rev = "023a0065398968989f2ddfcf5cc72bb886d02675", optional = true }
+
+[features]
+# KCP as the comparison transport in examples/lossprobe.rs
+kcp = ["dep:kcp-sys"]
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -39,6 +44,11 @@ lazy_static = "1"
 env_logger = "0.11.3"
 chrono = "0.4.28"
 clap = "3"
+
+[[example]]
+name = "lossprobe"
+path = "examples/lossprobe.rs"
+bench = false
 
 [[example]]
 name = "ping"

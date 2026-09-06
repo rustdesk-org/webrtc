@@ -12,7 +12,7 @@
 //! ```text
 //! PROTO=sctp|kcp   NC=1 sends without a congestion window (default), NC=0 with one
 //! OWD=35           one-way delay, ms                   RATE=30       link rate, Mbps
-//! RATE_REV=RATE    reverse-direction rate              OVERHEAD=57|28  per-packet IP/UDP(/DTLS) bytes
+//! RATE_REV=RATE    reverse-direction rate              OVERHEAD=65|28  per-packet IP/UDP(/DTLS) bytes
 //! LOSS=0           % of packets lost, both ways        BURST_MS=0    mean length of a loss burst
 //! JITTER=0         ms of queueing-style jitter         JITTER_IID=1  independent per packet instead
 //! REORDER=0        per mille sent REORDER_MS early     QUEUE_MS=0    buffer; longer waits are dropped
@@ -20,7 +20,11 @@
 //! DIP_EVERY=0 DIP_MS=0 DIP_RATE=1  the link runs at DIP_RATE Mbps for DIP_MS every DIP_EVERY ms
 //! FRAME=12000 FPS=30 FRAMES=300     the workload: FRAMES frames of FRAME bytes at FPS
 //! GAP_EVERY=0 GAP_MS=0              pause GAP_MS after every GAP_EVERY frames: bursts with tails
-//! TAILDROP=0                        drop the last TAILDROP packets of every burst
+//! TAILDROP=0                        drop the last TAILDROP packets of every burst. The pipe
+//!                                    drops the next packets it is handed, retransmissions of
+//!                                    an earlier burst included, so a tail-loss run wants one
+//!                                    burst (GAP_EVERY=FRAMES) and several seeds rather than
+//!                                    bursts whose recovery can overlap the next drop.
 //! SEED=1 DEADLINE=60
 //! ```
 //!
@@ -765,8 +769,10 @@ async fn main() {
     let link = Link {
         rate: rate as f64,
         rate_rev: env_u64("RATE_REV", rate) as f64,
-        // IP and UDP, and for SCTP the DTLS record it travels in.
-        overhead: env_u64("OVERHEAD", if proto == "kcp" { 28 } else { 57 }) as usize,
+        // What a packet costs outside the transport's own header, on IPv4: 20 IP + 8 UDP,
+        // and for SCTP the 37-byte DTLS record `INITIAL_MTU` is sized around (13 header, 8
+        // explicit nonce, 16 GCM tag). On IPv6 both are 20 bytes more.
+        overhead: env_u64("OVERHEAD", if proto == "kcp" { 28 } else { 65 }) as usize,
         seed: env_u64("SEED", 1),
         delay: Duration::from_millis(env_u64("OWD", 35)),
         loss: env_u64("LOSS", 0),

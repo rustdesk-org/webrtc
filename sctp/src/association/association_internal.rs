@@ -1375,7 +1375,7 @@ impl AssociationInternal {
             }
         } else {
             log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
-            let first = self.t3_rto_from_latest_send();
+            let first = self.t3_restart_interval();
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.start_after(first, self.rto_mgr.get_rto()).await;
             }
@@ -1588,6 +1588,19 @@ impl AssociationInternal {
         }
         self.reo_wnd_seen_at = Some(now);
         self.reo_wnd_dup_at = Some(now);
+    }
+
+    /// The interval a SACK restarts T3-rtx with. A SACK that drew a retransmission - the next
+    /// probe, or the withheld chunks settled as lost - arms a whole RTO, since the write loop
+    /// has yet to send it: the interval counted from the latest send can be a millisecond or
+    /// two, and a timeout firing in between would mark everything afresh and undo the recovery
+    /// this SACK decided on. The write loop restarts the timer again from the actual send.
+    fn t3_restart_interval(&self) -> u64 {
+        if self.no_congestion_control && self.t3_retransmit_restarts_timer {
+            self.rto_mgr.get_rto()
+        } else {
+            self.t3_rto_from_latest_send()
+        }
     }
 
     /// The interval for a T3-rtx restarted by a SACK. Without a congestion window it is RTO
@@ -1895,8 +1908,15 @@ impl AssociationInternal {
         if !self.inflight_queue.is_empty() {
             // Start timer. (noop if already started)
             log::trace!("[{}] T3-rtx timer start (pt3)", self.name);
-            let first = self.t3_rto_from_latest_send();
+            // A SACK that drew a retransmission stops the timer first, so that the full RTO
+            // `t3_restart_interval` returns for it actually takes: `start` is a no-op on a
+            // running timer, and the interval already armed can be a millisecond or two.
+            let provisional = self.no_congestion_control && self.t3_retransmit_restarts_timer;
+            let first = self.t3_restart_interval();
             if let Some(t3rtx) = &self.t3rtx {
+                if provisional {
+                    t3rtx.stop().await;
+                }
                 t3rtx.start_after(first, self.rto_mgr.get_rto()).await;
             }
         } else if state == AssociationState::ShutdownPending {

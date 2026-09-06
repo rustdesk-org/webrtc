@@ -1356,6 +1356,30 @@ async fn test_assoc_no_congestion_control_t3_probe_duplicates_do_not_widen_the_w
     Ok(())
 }
 
+// A SACK that drew a retransmission arms a whole RTO, not the sliver left of it counted from
+// the latest send: the timer must not fire before the write loop sends what the SACK asked for.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_restart_waits_for_a_sack_drawn_resend() -> Result<()>
+{
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    a.rto_mgr.set_rto(100, true);
+    a.last_send_at = Instant::now() - Duration::from_millis(99);
+
+    assert!(
+        a.t3_restart_interval() <= 3,
+        "nothing drawn: counted from the latest send"
+    );
+    a.t3_retransmit_restarts_timer = true;
+    assert_eq!(
+        a.t3_restart_interval(),
+        100,
+        "a resend to come: a whole RTO for it to go out in"
+    );
+
+    Ok(())
+}
+
 // A T3-rtx restarted by a SACK is timed from the latest send without a congestion window, and
 // from the SACK with one.
 #[tokio::test]

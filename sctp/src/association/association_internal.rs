@@ -91,9 +91,12 @@ pub struct AssociationInternal {
     /// When that timeout fired.
     pub(crate) t3_at: Instant,
     t3_probe_sent: bool,
-    /// When the probe went out: a SACK for its TSN sooner than half the least RTT after that
-    /// can only be the original's.
+    /// When the latest probe went out: a SACK for its TSN sooner than the least RTT after
+    /// that can only be the original's.
     pub(crate) t3_probe_sent_at: Instant,
+    /// Probes acked no sooner than the least RTT after they went out since the timeout, with
+    /// no original arriving between: two of them settle the withheld chunks as lost.
+    t3_probes_confirmed: u32,
     /// The least RTT sampled, ms.
     pub(crate) min_rtt: Option<u64>,
     /// TSNs the last T3 probe carried: a duplicate report for one of them says the timeout was
@@ -229,6 +232,7 @@ impl AssociationInternal {
             t3_at: Instant::now(),
             t3_probe_sent: false,
             t3_probe_sent_at: Instant::now(),
+            t3_probes_confirmed: 0,
             min_rtt: None,
             t3_probe_tsns: vec![],
             last_send_at: Instant::now(),
@@ -1576,11 +1580,15 @@ impl AssociationInternal {
     /// a SACK is in - a first transmission made the reordering window after the timeout, so
     /// that on a path that reorders it cannot merely have overtaken them. The probe acked and
     /// nothing else says nothing, since a SACK does not tell the original from the resend; the
-    /// next SACK does, unless nothing sent after the timeout is left to draw one, in which
-    /// case the marked chunks go out as F-RTO falls back to - but only once the probe has
-    /// been out for half the least RTT, since a SACK sooner than that is the original's, as
-    /// RACK (RFC 8985 sec 6.1) tells the two apart: a burst still draining from a slow link
-    /// acks the originals one after another, and none of them says the rest were lost.
+    /// next SACK does, and where nothing sent after the timeout is left to draw one, the next
+    /// marked chunk goes out as the next probe to draw it, as F-RTO sends new data. A probe
+    /// acked sooner than the least RTT after it went out is the original's, as RACK (RFC 8985
+    /// sec 6.1) tells the two apart; a burst draining from a slow link after a stall acks its
+    /// originals one after another, and the next probe's original follows the first's within
+    /// a packet's time, so it settles the timeout as early and the marks come off. Two probes
+    /// acked no sooner than the least RTT after they went out, with no original in between,
+    /// settle the withheld chunks as lost, and they go out at once; with no RTT sampled yet
+    /// nothing is settled on probes alone.
     fn resolve_t3_withholding(&mut self) {
         let Some(since) = self.t3_withheld_since else {
             return;
@@ -1598,14 +1606,26 @@ impl AssociationInternal {
         if withheld_acked {
             self.inflight_queue.unmark_all_to_retransmit();
             self.t3_withheld_since = None;
-        } else if later_first_acked
-            || (!self.sacked_sends.is_empty()
-                && !self.inflight_queue.has_first_transmission_since(since)
-                && self.t3_probe_sent
-                && self.t3_probe_sent_at.elapsed().as_millis() as u64 * 2
-                    >= self.min_rtt.unwrap_or(0))
-        {
+        } else if later_first_acked {
             self.t3_withheld_since = None;
+            self.awake_write_loop();
+        } else if !self.sacked_sends.is_empty()
+            && !self.inflight_queue.has_first_transmission_since(since)
+            && self.t3_probe_sent
+        {
+            let Some(min_rtt) = self.min_rtt else {
+                return;
+            };
+            // Two milliseconds of tolerance for the millisecond granularity of both sides.
+            if self.t3_probe_sent_at.elapsed().as_millis() as u64 + 2 < min_rtt {
+                return;
+            }
+            self.t3_probes_confirmed += 1;
+            if self.t3_probes_confirmed >= 2 {
+                self.t3_withheld_since = None;
+            } else {
+                self.t3_probe_sent = false;
+            }
             self.awake_write_loop();
         }
     }
@@ -2502,7 +2522,7 @@ impl AssociationInternal {
         if probe {
             self.t3_probe_sent = true;
             self.t3_probe_sent_at = Instant::now();
-            self.t3_probe_tsns = chunks.iter().map(|c| c.tsn).collect();
+            self.t3_probe_tsns.extend(chunks.iter().map(|c| c.tsn));
         }
         self.bundle_data_chunks_into_packets(chunks)
     }
@@ -2813,6 +2833,8 @@ impl RtxTimerObserver for AssociationInternal {
                         self.t3_withheld_since = Some(self.send_seq);
                         self.t3_at = Instant::now();
                         self.t3_probe_sent = false;
+                        self.t3_probes_confirmed = 0;
+                        self.t3_probe_tsns.clear();
                     } else {
                         // Whatever an earlier timeout withheld is marked afresh and goes out.
                         self.t3_withheld_since = None;

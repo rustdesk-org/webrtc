@@ -1206,10 +1206,12 @@ async fn test_assoc_no_congestion_control_t3_settlement_respects_the_reordering_
     Ok(())
 }
 
-// With nothing sent after the timeout to draw a telling SACK, the probe's ack is all there will
-// be, and the withheld chunks go out on it.
+// With nothing sent after the timeout to draw a telling SACK, a probe's ack draws the next
+// probe, and two probes acked an RTT after they went out settle the rest as lost. A SACK for
+// a probe's TSN sooner than that is the original's, and settles nothing; with no RTT sampled
+// yet, nothing is settled on probes at all.
 #[tokio::test]
-async fn test_assoc_no_congestion_control_t3_resends_the_rest_when_nothing_else_can_tell(
+async fn test_assoc_no_congestion_control_t3_probes_twice_when_nothing_else_can_tell(
 ) -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
@@ -1217,11 +1219,9 @@ async fn test_assoc_no_congestion_control_t3_resends_the_rest_when_nothing_else_
     inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
 
-    // A SACK for the probe's TSN right after the probe went out is the original arriving
-    // from behind the timeout, and says nothing about the rest.
     sack(&mut a, 11, &[]).await?;
     assert!(a.t3_withheld_since.is_some(), "sooner than an RTT: the original");
-    assert!(a.get_data_packets_to_retransmit().is_empty());
+    assert!(a.get_data_packets_to_retransmit().is_empty(), "and no new probe");
 
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
@@ -1231,8 +1231,60 @@ async fn test_assoc_no_congestion_control_t3_resends_the_rest_when_nothing_else_
     a.t3_probe_sent_at = Instant::now() - Duration::from_millis(70);
 
     sack(&mut a, 11, &[]).await?;
-    assert!(a.t3_withheld_since.is_none(), "an RTT later: the probe's own ack");
-    assert_eq!(tsns(&a.get_data_packets_to_retransmit()), (12..=19).collect::<Vec<u32>>());
+    assert!(a.t3_withheld_since.is_some(), "one probe confirmed: not yet");
+    assert_eq!(
+        tsns(&a.get_data_packets_to_retransmit()),
+        vec![12, 13],
+        "the next probe"
+    );
+    assert!(a.get_data_packets_to_retransmit().is_empty());
+
+    a.t3_probe_sent_at = Instant::now() - Duration::from_millis(70);
+    sack(&mut a, 13, &[]).await?;
+    assert!(a.t3_withheld_since.is_none(), "two probes confirmed: lost");
+    assert_eq!(
+        tsns(&a.get_data_packets_to_retransmit()),
+        (14..=19).collect::<Vec<u32>>()
+    );
+
+    let mut a = create_client_association_internal();
+    a.no_congestion_control = true;
+    inflight_10_to_19_of_500(&mut a);
+    t3_expires(&mut a).await;
+    a.t3_probe_sent_at = Instant::now() - Duration::from_millis(70);
+
+    sack(&mut a, 11, &[]).await?;
+    assert!(a.t3_withheld_since.is_some(), "no RTT sampled: nothing settled");
+    assert!(a.get_data_packets_to_retransmit().is_empty());
+
+    Ok(())
+}
+
+// Exactly NO_CC_T3_TAIL_PACKETS packets' worth goes out at once; one packet more is probed.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_t3_tail_bound_is_four_packets() -> Result<()> {
+    for (chunks, all) in [(8u32, true), (9, false)] {
+        let mut a = create_client_association_internal();
+        a.no_congestion_control = true;
+        a.cumulative_tsn_ack_point = 9;
+        a.my_next_tsn = 10 + chunks;
+        a.send_seq = u64::from(10 + chunks);
+        a.rwnd = 100_000;
+        for tsn in 10..10 + chunks {
+            a.inflight_queue.push_no_check(ChunkPayloadData {
+                tsn,
+                user_data: Bytes::from(vec![0u8; 500]),
+                nsent: 1,
+                sent_seq: u64::from(tsn),
+                sent_at: at(u64::from(tsn)),
+                ..Default::default()
+            });
+        }
+
+        let packets = t3_expires(&mut a).await;
+        assert_eq!(a.t3_withheld_since.is_none(), all, "{chunks} chunks of 500");
+        assert_eq!(packets.len(), if all { 4 } else { 1 }, "{chunks} chunks of 500");
+    }
 
     Ok(())
 }

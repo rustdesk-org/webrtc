@@ -2915,9 +2915,10 @@ async fn wait_queued(br: &Arc<Bridge>, id: usize, n: usize) {
     }
 }
 
-// Six packets lost, the peer 70ms away: the timeout's probe is acked at t+170, draws the
-// second probe, acked at t+240, which settles the rest as lost and sends them. That resend is
-// a SACK's doing, so T3-rtx runs from it: no timeout before their acks can be back.
+// Six packets lost, the peer 70ms away: the timeout's probe at t+200 is acked at t+270, draws
+// the second probe, acked at t+340, which settles the rest as lost and sends them. That resend
+// is a SACK's doing, so T3-rtx runs from it, not from the backoff the timeout left, which would
+// have fired at t+600.
 #[tokio::test]
 async fn test_assoc_no_congestion_control_bulk_resend_restarts_t3rtx() -> Result<()> {
     const SI: u16 = 6;
@@ -2929,8 +2930,8 @@ async fn test_assoc_no_congestion_control_bulk_resend_restarts_t3rtx() -> Result
     {
         let mut a = a0.association_internal.lock().await;
         a.no_congestion_control = true;
-        a.rto_mgr.set_rto(100, true);
-        a.min_rtt = Some(70);
+        a.rto_mgr.set_rto(200, true);
+        a.min_rtt_window = [Some(70), None];
         a.stats.reset();
     }
 
@@ -2945,21 +2946,21 @@ async fn test_assoc_no_congestion_control_bulk_resend_restarts_t3rtx() -> Result
         .await?;
     }
 
-    // t+100: the timeout's probe. Delivered at once; its SACK held until t+170.
-    tokio::time::sleep_until(t0 + Duration::from_millis(100)).await;
+    // t+200: the timeout's probe. Delivered at once; its SACK held until t+270.
+    tokio::time::sleep_until(t0 + Duration::from_millis(200)).await;
     wait_queued(&br, 0, 1).await;
     assert_eq!(br.len(0).await, 1, "one probe");
     br.tick().await;
     wait_queued(&br, 1, 1).await;
-    tokio::time::sleep_until(t0 + Duration::from_millis(170)).await;
+    tokio::time::sleep_until(t0 + Duration::from_millis(270)).await;
     br.tick().await;
 
-    // Its ack draws the second probe; its SACK held until t+240.
+    // Its ack draws the second probe; its SACK held until t+340.
     wait_queued(&br, 0, 1).await;
     assert_eq!(br.len(0).await, 1, "the second probe");
     br.tick().await;
     wait_queued(&br, 1, 1).await;
-    tokio::time::sleep_until(t0 + Duration::from_millis(240)).await;
+    tokio::time::sleep_until(t0 + Duration::from_millis(340)).await;
     br.tick().await;
 
     // Two probes confirmed: the rest go out, and T3-rtx must run from that send.
@@ -2969,7 +2970,7 @@ async fn test_assoc_no_congestion_control_bulk_resend_restarts_t3rtx() -> Result
         let a = a0.association_internal.lock().await;
         assert_eq!(a.stats.get_num_t3timeouts(), 1, "one timeout so far");
     }
-    tokio::time::sleep_until(t0 + Duration::from_millis(300)).await;
+    tokio::time::sleep_until(t0 + Duration::from_millis(500)).await;
     {
         let a = a0.association_internal.lock().await;
         assert_eq!(

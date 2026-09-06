@@ -1215,7 +1215,7 @@ async fn test_assoc_no_congestion_control_t3_probes_twice_when_nothing_else_can_
 ) -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
-    a.min_rtt = Some(70);
+    a.min_rtt_window = [Some(70), None];
     inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
 
@@ -1225,7 +1225,7 @@ async fn test_assoc_no_congestion_control_t3_probes_twice_when_nothing_else_can_
 
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
-    a.min_rtt = Some(70);
+    a.min_rtt_window = [Some(70), None];
     inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
     a.t3_probe_sent_at = Instant::now() - Duration::from_millis(70);
@@ -1267,7 +1267,7 @@ async fn test_assoc_no_congestion_control_t3_probe_confirmation_needs_the_probe_
 ) -> Result<()> {
     let mut a = create_client_association_internal();
     a.no_congestion_control = true;
-    a.min_rtt = Some(70);
+    a.min_rtt_window = [Some(70), None];
     inflight_10_to_19_of_500(&mut a);
     t3_expires(&mut a).await;
     a.inflight_queue.push_no_check(ChunkPayloadData {
@@ -1352,6 +1352,30 @@ async fn test_assoc_no_congestion_control_t3_probe_duplicates_do_not_widen_the_w
     assert_eq!(a.reo_wnd_mult, 0, "the probe's own duplicates");
     sack_with_dups(&mut a, 11, &[], &[12]).await?;
     assert_eq!(a.reo_wnd_mult, 1, "any other duplicate counts");
+
+    Ok(())
+}
+
+// The least RTT is a windowed minimum, as RACK's is (RFC 8985 sec 6.1): a path that grows
+// longer raises it, where the connection's lifetime minimum would keep letting an ack too
+// early to be a probe's confirm one.
+#[tokio::test]
+async fn test_assoc_min_rtt_follows_a_path_that_grew_longer() -> Result<()> {
+    let mut a = create_client_association_internal();
+    a.note_min_rtt(20);
+    assert_eq!(a.min_rtt(), Some(20), "the only sample");
+
+    a.min_rtt_window_at = Instant::now() - MIN_RTT_WINDOW;
+    a.note_min_rtt(80);
+    assert_eq!(a.min_rtt(), Some(20), "one window on: 20 is still in the filter");
+
+    a.min_rtt_window_at = Instant::now() - MIN_RTT_WINDOW;
+    a.note_min_rtt(80);
+    assert_eq!(a.min_rtt(), Some(80), "two windows on: only the longer path is left");
+
+    a.min_rtt_window_at = Instant::now() - MIN_RTT_WINDOW * 2;
+    a.note_min_rtt(90);
+    assert_eq!(a.min_rtt(), Some(90), "a gap of two windows leaves nothing older");
 
     Ok(())
 }

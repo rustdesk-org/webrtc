@@ -11,6 +11,9 @@ use crate::param::param_unrecognized::ParamUnrecognized;
 use crate::util::get_padding_size;
 use std::time::{Duration, Instant};
 
+/// How long a window of the least-RTT filter runs; two of them are kept.
+const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
+
 pub struct AssociationInternal {
     pub(crate) name: String,
     pub(crate) state: Arc<AtomicU8>,
@@ -105,8 +108,10 @@ pub struct AssociationInternal {
     /// Probes acked no sooner than the least RTT after they went out since the timeout, with
     /// no original arriving between: two of them settle the withheld chunks as lost.
     t3_probes_confirmed: u32,
-    /// The least RTT sampled, ms.
-    pub(crate) min_rtt: Option<u64>,
+    /// The least RTT sampled recently, ms, as two windows of `MIN_RTT_WINDOW`: the one being
+    /// filled and the one before it.
+    pub(crate) min_rtt_window: [Option<u64>; 2],
+    min_rtt_window_at: Instant,
     /// TSNs the last T3 probe carried: a duplicate report for one of them says the timeout was
     /// early, not that the path reorders.
     t3_probe_tsns: Vec<u32>,
@@ -243,7 +248,8 @@ impl AssociationInternal {
             t3_retransmit_restarts_timer: false,
             t3_probe_sent_at: Instant::now(),
             t3_probes_confirmed: 0,
-            min_rtt: None,
+            min_rtt_window: [None, None],
+            min_rtt_window_at: Instant::now(),
             t3_probe_tsns: vec![],
             last_send_at: Instant::now(),
 
@@ -1373,13 +1379,18 @@ impl AssociationInternal {
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.stop().await;
             }
-        } else {
+        } else if !self.no_congestion_control {
             log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
             let first = self.t3_restart_interval();
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.start_after(first, self.rto_mgr.get_rto()).await;
             }
         }
+        // Without a congestion window the timer is armed once per SACK, by `postprocess_sack`
+        // after the loss detection has run: arming it here would use an interval counted from
+        // the latest send, a millisecond or two after an ack that came an RTO late, and
+        // `stop()` cannot call back a timer task that has already taken its timeout branch
+        // and is waiting on the association's lock. Stop, decide, arm once.
 
         // Update congestion control parameters
         if self.cwnd <= self.ssthresh {
@@ -1590,7 +1601,8 @@ impl AssociationInternal {
         self.reo_wnd_dup_at = Some(now);
     }
 
-    /// The interval a SACK restarts T3-rtx with. A SACK that drew a retransmission - the next
+    /// The interval a SACK restarts T3-rtx with, once its loss detection has run. A SACK that
+    /// drew a retransmission - the next
     /// probe, or the withheld chunks settled as lost - arms a whole RTO, since the write loop
     /// has yet to send it: the interval counted from the latest send can be a millisecond or
     /// two, and a timeout firing in between would mark everything afresh and undo the recovery
@@ -1619,8 +1631,30 @@ impl AssociationInternal {
         rto.saturating_sub(age).max(1)
     }
 
+    /// The least RTT sampled over the last window or two, which RACK (RFC 8985 sec 6.1) asks
+    /// for in place of the connection's lifetime minimum, so that a path that grows longer
+    /// raises it: the guard it serves - an ack sooner than this cannot be a probe's - would
+    /// otherwise go on trusting a round trip the path no longer has.
+    pub(crate) fn min_rtt(&self) -> Option<u64> {
+        match self.min_rtt_window {
+            [Some(a), Some(b)] => Some(a.min(b)),
+            [a, b] => a.or(b),
+        }
+    }
+
     fn note_min_rtt(&mut self, rtt: u64) {
-        self.min_rtt = Some(self.min_rtt.map_or(rtt, |m| m.min(rtt)));
+        let now = Instant::now();
+        let since = now.duration_since(self.min_rtt_window_at);
+        if since >= MIN_RTT_WINDOW {
+            self.min_rtt_window[1] = if since >= MIN_RTT_WINDOW * 2 {
+                None
+            } else {
+                self.min_rtt_window[0]
+            };
+            self.min_rtt_window[0] = None;
+            self.min_rtt_window_at = now;
+        }
+        self.min_rtt_window[0] = Some(self.min_rtt_window[0].map_or(rtt, |m| m.min(rtt)));
     }
 
     /// The chunks a T3-rtx marked and withheld, settled by this SACK as RFC 5682 (F-RTO)
@@ -1670,7 +1704,7 @@ impl AssociationInternal {
             self.t3_retransmit_restarts_timer = true;
             self.awake_write_loop();
         } else if latest_probe_acked {
-            let Some(min_rtt) = self.min_rtt else {
+            let Some(min_rtt) = self.min_rtt() else {
                 return;
             };
             // Two milliseconds of tolerance for the millisecond granularity of both sides.

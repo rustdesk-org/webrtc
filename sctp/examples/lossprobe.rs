@@ -15,7 +15,8 @@
 //! RATE_REV=RATE    reverse-direction rate              OVERHEAD=65|28  per-packet IP/UDP(/DTLS) bytes
 //! LOSS=0           % of packets lost, both ways        BURST_MS=0    mean length of a loss burst
 //! JITTER=0         ms of queueing-style jitter         JITTER_IID=1  independent per packet instead
-//! REORDER=0        per mille sent REORDER_MS early     QUEUE_MS=0    buffer; longer waits are dropped
+//! REORDER=0        per mille sent REORDER_MS early     QUEUE_MS=0    buffer depth at RATE
+//! QUEUE_BYTES=0    buffer in bytes, overrides QUEUE_MS
 //! SPIKE_EVERY=0 SPIKE_MS=0      the link sends nothing for SPIKE_MS every SPIKE_EVERY ms
 //! DIP_EVERY=0 DIP_MS=0 DIP_RATE=1  the link runs at DIP_RATE Mbps for DIP_MS every DIP_EVERY ms
 //! FRAME=12000 FPS=30 FRAMES=300     the workload: FRAMES frames of FRAME bytes at FPS
@@ -67,8 +68,14 @@ fn env_u64(k: &str, d: u64) -> u64 {
 #[derive(Default)]
 struct LinkStats {
     pkts: AtomicU64,
+    /// Bytes handed to the link. Counted before the buffer decides, so this is what the sender
+    /// offered, not what went out - the two differ by exactly `drop_bytes` and only a run with
+    /// no tail drops can read them as the same number.
+    offered: AtomicU64,
+    /// Bytes the bottleneck actually put on the wire: offered, less what the buffer turned away.
     bytes: AtomicU64,
     dropped: AtomicU64,
+    drop_bytes: AtomicU64,
 }
 
 /// The path as a function of time, a millisecond a tick: what a packet meets depends on when
@@ -168,8 +175,13 @@ struct Impair {
     /// Per mille of packets that arrive `reorder_by` early, as netem's reorder sends them.
     reorder: u64,
     reorder_by: Duration,
-    /// A packet whose queueing wait would exceed this is dropped at the buffer's tail.
-    queue: Duration,
+    /// Buffer at the bottleneck. A packet arriving with this many bytes already waiting is
+    /// dropped at the tail. Zero is unbounded.
+    ///
+    /// Sized in bytes rather than in waiting time on purpose: a time bound also fires on a
+    /// packet entering an EMPTY buffer during a stall, since its wait is the stall, and that
+    /// turns a stall into a black hole instead of a buffer that fills and then overflows.
+    queue_bytes: u64,
     /// Every `spike_every`, the link sends nothing for `spike_len`; packets queue behind it.
     spike_every: Duration,
     spike_len: Duration,
@@ -196,6 +208,9 @@ fn pipe(
     tokio::spawn(async move {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut last_depart = Instant::now();
+        // What the buffer is holding: everything accepted whose departure is still ahead.
+        let mut buffered: std::collections::VecDeque<(Instant, u64)> = Default::default();
+        let mut buffered_bytes = 0u64;
         let mut last_at = last_depart;
         let mut heap: BinaryHeap<Scheduled> = BinaryHeap::new();
         let mut seq = 0u64;
@@ -210,11 +225,10 @@ fn pipe(
                 item = in_rx.recv(), if open => match item {
                     Some((sent, b)) => {
                         let impaired = loss_on.load(Ordering::Relaxed);
+                        let wire = (b.len() + im.overhead) as u64;
                         if impaired {
                             stats.pkts.fetch_add(1, Ordering::Relaxed);
-                            stats
-                                .bytes
-                                .fetch_add((b.len() + im.overhead) as u64, Ordering::Relaxed);
+                            stats.offered.fetch_add(wire, Ordering::Relaxed);
                         }
                         // The path's clock starts with the workload, the same for every
                         // transport and both directions.
@@ -245,10 +259,26 @@ fn pipe(
                             + Duration::from_secs_f64(
                                 (b.len() + im.overhead) as f64 * 8.0 / (rate * 1e6),
                             );
-                        if impaired && !im.queue.is_zero() && depart.duration_since(sent) > im.queue {
+                        // Drain first: anything whose departure has passed has left the buffer.
+                        while let Some(&(d, n)) = buffered.front() {
+                            if d <= sent {
+                                buffered.pop_front();
+                                buffered_bytes -= n;
+                            } else {
+                                break;
+                            }
+                        }
+                        if impaired && im.queue_bytes > 0 && buffered_bytes + wire > im.queue_bytes
+                        {
                             stats.dropped.fetch_add(1, Ordering::Relaxed);
+                            stats.drop_bytes.fetch_add(wire, Ordering::Relaxed);
                             continue;
                         }
+                        if impaired {
+                            stats.bytes.fetch_add(wire, Ordering::Relaxed);
+                        }
+                        buffered.push_back((depart, wire));
+                        buffered_bytes += wire;
                         last_depart = depart;
                         let lost = if im.burst.is_zero() {
                             rng.gen_range(0..100u64) < im.loss
@@ -319,7 +349,7 @@ struct Link {
     jitter_iid: bool,
     reorder: u64,
     reorder_by: Duration,
-    queue: Duration,
+    queue_bytes: u64,
     spike_every: Duration,
     spike_len: Duration,
     dip_every: Duration,
@@ -348,7 +378,7 @@ impl Link {
             jitter_iid: self.jitter_iid,
             reorder: self.reorder,
             reorder_by: self.reorder_by,
-            queue: self.queue,
+            queue_bytes: self.queue_bytes,
             spike_every: self.spike_every,
             spike_len: self.spike_len,
             dip_every: if rev { Duration::ZERO } else { self.dip_every },
@@ -781,7 +811,16 @@ async fn main() {
         jitter_iid: env_u64("JITTER_IID", 0) == 1,
         reorder: env_u64("REORDER", 0),
         reorder_by: Duration::from_millis(env_u64("REORDER_MS", 10)),
-        queue: Duration::from_millis(env_u64("QUEUE_MS", 0)),
+        queue_bytes: {
+            let explicit = env_u64("QUEUE_BYTES", 0);
+            if explicit > 0 {
+                explicit
+            } else {
+                // What fits in that many milliseconds at the nominal rate, which is how a
+                // buffer of a given depth is usually quoted.
+                env_u64("QUEUE_MS", 0) * rate * 1_000_000 / 8 / 1000
+            }
+        },
         spike_every: Duration::from_millis(env_u64("SPIKE_EVERY", 0)),
         spike_len: Duration::from_millis(env_u64("SPIKE_MS", 0)),
         dip_every: Duration::from_millis(env_u64("DIP_EVERY", 0)),
@@ -815,7 +854,7 @@ async fn main() {
     let miss = |ms: u128| sorted.iter().filter(|d| d.as_millis() > ms).count() + undelivered;
     let app = (w.frame * w.frames) as f64;
     println!(
-        "RESULT proto={} nc={} rate={} rev={} ovh={} owd={} loss={} burst_ms={} jitter={}{} reorder={} queue={} spike={}/{} dip={}/{}@{} frame={} fps={} gap={}/{} taildrop={} seed={} delivered={}/{} total={:.2}s mean={:.0} p50={:.0} p90={:.0} p99={:.0} max={:.0} miss100={} miss200={} miss500={} wire_fwd={:.2}x pkts_fwd={} drop_fwd={} bytes_rev={} pkts_rev={}",
+        "RESULT proto={} nc={} rate={} rev={} ovh={} owd={} loss={} burst_ms={} jitter={}{} reorder={} queue_bytes={} spike={}/{} dip={}/{}@{} frame={} fps={} gap={}/{} taildrop={} seed={} delivered={}/{} total={:.2}s mean={:.0} p50={:.0} p90={:.0} p99={:.0} max={:.0} miss100={} miss200={} miss500={} offered_fwd={:.2}x wire_fwd={:.2}x pkts_fwd={} drop_fwd={} drop_bytes_fwd={} bytes_rev={} pkts_rev={}",
         proto,
         nc as u8,
         link.rate,
@@ -827,7 +866,7 @@ async fn main() {
         link.jitter.as_millis(),
         if link.jitter_iid { "iid" } else { "" },
         link.reorder,
-        link.queue.as_millis(),
+        link.queue_bytes,
         link.spike_len.as_millis(),
         link.spike_every.as_millis(),
         link.dip_len.as_millis(),
@@ -850,9 +889,11 @@ async fn main() {
         miss(100),
         miss(200),
         miss(500),
+        link.ab.offered.load(Ordering::Relaxed) as f64 / app,
         link.ab.bytes.load(Ordering::Relaxed) as f64 / app,
         link.ab.pkts.load(Ordering::Relaxed),
         link.ab.dropped.load(Ordering::Relaxed),
+        link.ab.drop_bytes.load(Ordering::Relaxed),
         link.ba.bytes.load(Ordering::Relaxed),
         link.ba.pkts.load(Ordering::Relaxed),
     );

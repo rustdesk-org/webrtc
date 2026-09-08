@@ -72,10 +72,6 @@ pub(crate) const NO_CC_MAX_INFLIGHT_CHUNKS: usize = 1024;
 /// late ack from its resend's, so a chunk whose acks keep arriving late would otherwise be resent
 /// for as long as chunks sent after it are acked.
 pub(crate) const NO_CC_FAST_RETRANS_LIMIT: u32 = 5;
-/// Most packets a T3-rtx resends at once without a congestion window: the most an early
-/// timeout may cost. When everything outstanding packs into this many, a lost tail recovers
-/// without waiting on a probe; a longer backlog is probed with one packet.
-pub(crate) const NO_CC_T3_TAIL_PACKETS: usize = 4;
 pub(crate) const COMMON_HEADER_SIZE: u32 = 12;
 pub(crate) const DATA_CHUNK_HEADER_SIZE: u32 = 16;
 pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;

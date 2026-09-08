@@ -29,6 +29,32 @@
 //! SEED=1 DEADLINE=60
 //! ```
 //!
+//! ## Scenarios, and which one a remote desktop actually is
+//!
+//! A remote desktop is SPARSE, not a steady frame rate. `video_service.rs` sends nothing while
+//! the screen does not change (the capturer answers WouldBlock), so typing, reading and clicking
+//! - the bulk of the work - are short bursts with silence between them. A fixed-fps run is what
+//! playing video or dragging a window looks like, and nothing else.
+//!
+//! This matters because the two disagree. A steady frame rate hides every fault in loss recovery:
+//! the next frame's SACK exposes the loss, so recovery is fast whatever the recovery logic does.
+//! Sparse traffic has no next frame, and the difference between recovery designs is several
+//! hundred milliseconds. A change measured only at fixed fps can look free and cost 2-4x the p99
+//! on the workload users actually have. That happened - see the revert this file's history
+//! carries - so run the sparse rows first, and never conclude from the continuous ones alone.
+//!
+//! ```text
+//! sparse_rtt70    OWD=35 LOSS=5 BURST_MS=20 GAP_EVERY=3 GAP_MS=400   <- the one that matters
+//! sparse_rtt150   OWD=75 LOSS=5 BURST_MS=20 GAP_EVERY=3 GAP_MS=400   <- and at a long path
+//! cont_random5    LOSS=5                                  video, dragging, scrolling
+//! stall_finite    RATE=5 QUEUE_MS=100 SPIKE_EVERY=2000 SPIKE_MS=300  contended link
+//! idle_stall      RATE=5 FRAME=80000 GAP_EVERY=1 GAP_MS=1000 SPIKE_EVERY=2000 SPIKE_MS=500
+//! tail4 / tail5   FRAMES=60 GAP_EVERY=60 TAILDROP=4|5 DEADLINE=10    the 4/5 packet step
+//! ```
+//!
+//! Two seeds at least; the sparse rows differ by more than the effect between seeds. Compare
+//! p99 and max, not the mean - the mean over a burst hides the one frame that waited.
+//!
 //! Loss, jitter and the channel state are one time-domain trace per direction, drawn from the
 //! seed at a millisecond a tick, and the path's clock starts with the workload rather than
 //! with the handshake, so every transport run with the same seed sees the same path; only

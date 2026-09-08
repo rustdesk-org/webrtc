@@ -11,9 +11,6 @@ use crate::param::param_unrecognized::ParamUnrecognized;
 use crate::util::get_padding_size;
 use std::time::{Duration, Instant};
 
-/// How long a window of the least-RTT filter runs; two of them are kept.
-const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
-
 pub struct AssociationInternal {
     pub(crate) name: String,
     pub(crate) state: Arc<AtomicU8>,
@@ -87,37 +84,6 @@ pub struct AssociationInternal {
     pub(crate) reo_wnd_seen_at: Option<Instant>,
     /// Last duplicate report; 16 srtt after it the window is back to one quarter.
     pub(crate) reo_wnd_dup_at: Option<Instant>,
-    /// Set by a T3-rtx without a congestion window: the send-order stamp at the timeout. The
-    /// chunks it marked stay stamped below it while they are withheld; the probe and anything
-    /// sent since are stamped above. `None` once `resolve_t3_withholding` has settled them.
-    pub(crate) t3_withheld_since: Option<u64>,
-    /// When that timeout fired.
-    pub(crate) t3_at: Instant,
-    t3_probe_sent: bool,
-    /// The send-order stamps of the latest probe's chunks, so a SACK is known to have acked
-    /// the probe itself and not something else sent since the timeout.
-    t3_probe_seqs: (u64, u64),
-    /// Whether the next retransmission is one a SACK drew - the next probe, or the withheld
-    /// chunks settled as lost - which restarts T3-rtx from its own send; the timeout's own
-    /// retransmissions leave the timer to its backoff. One-shot: the next pass of the write
-    /// loop consumes it, packets or not.
-    t3_retransmit_restarts_timer: bool,
-    /// When the latest probe went out: a SACK for its TSN sooner than the least RTT after
-    /// that can only be the original's.
-    pub(crate) t3_probe_sent_at: Instant,
-    /// Probes acked no sooner than the least RTT after they went out since the timeout, with
-    /// no original arriving between: two of them settle the withheld chunks as lost.
-    t3_probes_confirmed: u32,
-    /// The least RTT sampled recently, ms, as two windows of `MIN_RTT_WINDOW`: the one being
-    /// filled and the one before it.
-    pub(crate) min_rtt_window: [Option<u64>; 2],
-    min_rtt_window_at: Instant,
-    /// TSNs the last T3 probe carried: a duplicate report for one of them says the timeout was
-    /// early, not that the path reorders.
-    t3_probe_tsns: Vec<u32>,
-    /// When the latest DATA chunk went out, first transmission or not; a T3-rtx restarted by a
-    /// SACK is counted from there.
-    pub(crate) last_send_at: Instant,
 
     // RTX & Ack timer
     pub(crate) rto_mgr: RtoManager,
@@ -241,17 +207,6 @@ impl AssociationInternal {
             reo_wnd_grown_at: None,
             reo_wnd_seen_at: None,
             reo_wnd_dup_at: None,
-            t3_withheld_since: None,
-            t3_at: Instant::now(),
-            t3_probe_sent: false,
-            t3_probe_seqs: (0, 0),
-            t3_retransmit_restarts_timer: false,
-            t3_probe_sent_at: Instant::now(),
-            t3_probes_confirmed: 0,
-            min_rtt_window: [None, None],
-            min_rtt_window_at: Instant::now(),
-            t3_probe_tsns: vec![],
-            last_send_at: Instant::now(),
 
             rto_mgr: if no_cc {
                 RtoManager::new_no_congestion_control()
@@ -580,10 +535,7 @@ impl AssociationInternal {
                         c.sent_seq = self.send_seq;
                         c.sent_at = Instant::now();
                         self.send_seq += 1;
-                        self.last_send_at = c.sent_at;
                         c.miss_indicator = 0;
-                        // A T3-rtx may have marked it too; resent here, it is not withheld.
-                        c.retransmit = false;
                     }
                 } else {
                     break; // end of pending data
@@ -704,9 +656,7 @@ impl AssociationInternal {
         let state = self.get_state();
         match state {
             AssociationState::Established => {
-                raw_packets = self
-                    .gather_data_packets_to_retransmit_restarting_t3rtx(raw_packets)
-                    .await;
+                raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
                 raw_packets = self
                     .gather_outbound_data_and_reconfig_packets(raw_packets)
                     .await;
@@ -720,9 +670,7 @@ impl AssociationInternal {
             AssociationState::ShutdownPending
             | AssociationState::ShutdownSent
             | AssociationState::ShutdownReceived => {
-                raw_packets = self
-                    .gather_data_packets_to_retransmit_restarting_t3rtx(raw_packets)
-                    .await;
+                raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
                 raw_packets = self
                     .gather_outbound_fast_retransmission_packets_restarting_t3rtx(raw_packets)
                     .await;
@@ -1225,11 +1173,7 @@ impl AssociationInternal {
         &mut self,
         d: &ChunkSelectiveAck,
     ) -> Result<(HashMap<u16, i64>, u32)> {
-        if self.no_congestion_control
-            && d.duplicate_tsn
-                .iter()
-                .any(|tsn| !self.t3_probe_tsns.contains(tsn))
-        {
+        if self.no_congestion_control && !d.duplicate_tsn.is_empty() {
             self.note_spurious_retransmission();
         }
         let mut bytes_acked_per_stream = HashMap::new();
@@ -1282,7 +1226,6 @@ impl AssociationInternal {
                             Err(_) => return Err(Error::ErrInvalidSystemTime),
                         };
                         let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
-                        self.note_min_rtt(rtt.as_millis() as u64);
                         log::trace!(
                             "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
                             self.name,
@@ -1343,7 +1286,6 @@ impl AssociationInternal {
                                 Err(_) => return Err(Error::ErrInvalidSystemTime),
                             };
                             let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
-                            self.note_min_rtt(rtt.as_millis() as u64);
                             log::trace!(
                                 "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
                                 self.name,
@@ -1379,18 +1321,12 @@ impl AssociationInternal {
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.stop().await;
             }
-        } else if !self.no_congestion_control {
+        } else {
             log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
-            let first = self.t3_restart_interval();
             if let Some(t3rtx) = &self.t3rtx {
-                t3rtx.start_after(first, self.rto_mgr.get_rto()).await;
+                t3rtx.start(self.rto_mgr.get_rto()).await;
             }
         }
-        // Without a congestion window the timer is armed once per SACK, by `postprocess_sack`
-        // after the loss detection has run: arming it here would use an interval counted from
-        // the latest send, a millisecond or two after an ack that came an RTO late, and
-        // `stop()` cannot call back a timer task that has already taken its timeout branch
-        // and is waiting on the association's lock. Stop, decide, arm once.
 
         // Update congestion control parameters
         if self.cwnd <= self.ssthresh {
@@ -1522,30 +1458,6 @@ impl AssociationInternal {
         Ok(())
     }
 
-    /// The timeout's retransmissions, and the T3-rtx restart a retransmission a SACK drew
-    /// calls for without a congestion window - the next probe, or the withheld chunks settled
-    /// as lost: it goes out after that SACK restarted the timer from the previous send, with
-    /// little of the RTO left, and the timer would fire again before its ack could arrive;
-    /// so, as a fast retransmission of the earliest chunk does, it restarts T3-rtx from its
-    /// own send. The timeout's own retransmissions leave the timer to its backoff, so an
-    /// outage is probed at RTO, 2 RTO, 4 RTO, not at every RTO.
-    async fn gather_data_packets_to_retransmit_restarting_t3rtx(
-        &mut self,
-        mut raw_packets: Vec<Packet>,
-    ) -> Vec<Packet> {
-        let before = raw_packets.len();
-        let restart = self.t3_retransmit_restarts_timer;
-        self.t3_retransmit_restarts_timer = false;
-        raw_packets = self.gather_data_packets_to_retransmit(raw_packets);
-        if self.no_congestion_control && restart && raw_packets.len() > before {
-            if let Some(t3rtx) = &self.t3rtx {
-                t3rtx.stop().await;
-                t3rtx.start(self.rto_mgr.get_rto()).await;
-            }
-        }
-        raw_packets
-    }
-
     /// Fast retransmission, and the T3-rtx restart it calls for without a congestion window -
     /// while data is still in flight, which the shutdown states are as much as Established.
     async fn gather_outbound_fast_retransmission_packets_restarting_t3rtx(
@@ -1601,127 +1513,6 @@ impl AssociationInternal {
         self.reo_wnd_dup_at = Some(now);
     }
 
-    /// The interval a SACK restarts T3-rtx with, once its loss detection has run. A SACK that
-    /// drew a retransmission - the next
-    /// probe, or the withheld chunks settled as lost - arms a whole RTO, since the write loop
-    /// has yet to send it: the interval counted from the latest send can be a millisecond or
-    /// two, and a timeout firing in between would mark everything afresh and undo the recovery
-    /// this SACK decided on. The write loop restarts the timer again from the actual send.
-    fn t3_restart_interval(&self) -> u64 {
-        if self.no_congestion_control && self.t3_retransmit_restarts_timer {
-            self.rto_mgr.get_rto()
-        } else {
-            self.t3_rto_from_latest_send()
-        }
-    }
-
-    /// The interval for a T3-rtx restarted by a SACK. Without a congestion window it is RTO
-    /// counted from the latest send, as QUIC arms its probe timeout (RFC 9002 sec 6.2), rather
-    /// than RTO from the SACK: a chunk lost at the tail of a stream is that latest send, so it
-    /// times out RTO after it went out, not RTO after the ack of the chunk before it. While
-    /// sends go on, the latest is recent and the interval is the RTO as before. Not the
-    /// earliest chunk's send: after a stall every chunk in the backlog is older than the RTO,
-    /// and that would fire a probe per SACK until the backlog is acked.
-    fn t3_rto_from_latest_send(&self) -> u64 {
-        let rto = self.rto_mgr.get_rto();
-        if !self.no_congestion_control {
-            return rto;
-        }
-        let age = self.last_send_at.elapsed().as_millis() as u64;
-        rto.saturating_sub(age).max(1)
-    }
-
-    /// The least RTT sampled over the last window or two, which RACK (RFC 8985 sec 6.1) asks
-    /// for in place of the connection's lifetime minimum, so that a path that grows longer
-    /// raises it: the guard it serves - an ack sooner than this cannot be a probe's - would
-    /// otherwise go on trusting a round trip the path no longer has.
-    pub(crate) fn min_rtt(&self) -> Option<u64> {
-        match self.min_rtt_window {
-            [Some(a), Some(b)] => Some(a.min(b)),
-            [a, b] => a.or(b),
-        }
-    }
-
-    fn note_min_rtt(&mut self, rtt: u64) {
-        let now = Instant::now();
-        let since = now.duration_since(self.min_rtt_window_at);
-        if since >= MIN_RTT_WINDOW {
-            self.min_rtt_window[1] = if since >= MIN_RTT_WINDOW * 2 {
-                None
-            } else {
-                self.min_rtt_window[0]
-            };
-            self.min_rtt_window[0] = None;
-            self.min_rtt_window_at = now;
-        }
-        self.min_rtt_window[0] = Some(self.min_rtt_window[0].map_or(rtt, |m| m.min(rtt)));
-    }
-
-    /// The chunks a T3-rtx marked and withheld, settled by this SACK as RFC 5682 (F-RTO)
-    /// settles a timeout. One of them acked: its first transmission arrived after all, so the
-    /// timeout was early and the marks come off - a chunk lost among them is found by the acks
-    /// of what follows it, as any other. A first transmission made after the timeout acked
-    /// while they are not: they are lost, and go out as RFC 4960 sec 6.3.3 has them, now that
-    /// a SACK is in - a first transmission made the reordering window after the timeout, so
-    /// that on a path that reorders it cannot merely have overtaken them. The probe acked and
-    /// nothing else says nothing, since a SACK does not tell the original from the resend; the
-    /// next SACK does, and the probe's own ack draws the next marked chunk as the next probe
-    /// to draw one, as F-RTO sends new data. The probe acked - the probe itself, by its send
-    /// stamps, not anything else sent since the timeout - sooner than the least RTT after it
-    /// went out is the original's, as RACK (RFC 8985 sec 6.1) tells the two apart; a burst
-    /// draining from a slow link after a stall acks its originals one after another, and the
-    /// next probe's original follows the first's within a packet's time, so it settles the
-    /// timeout as early and the marks come off. Two probes acked no sooner than the least RTT
-    /// after they went out, with no original in between, settle the withheld chunks as lost,
-    /// and they go out at once; with no RTT sampled yet nothing is settled on probes alone.
-    fn resolve_t3_withholding(&mut self) {
-        let Some(since) = self.t3_withheld_since else {
-            return;
-        };
-        if self.inflight_queue.get_num_bytes_to_retransmit() == 0 {
-            self.t3_withheld_since = None;
-            self.t3_retransmit_restarts_timer = false;
-            return;
-        }
-        let withheld_acked = self.sacked_sends.iter().any(|&(s, _, _)| s < since);
-        let after_window = self.t3_at + self.reo_wnd;
-        let later_first_acked = self
-            .sacked_sends
-            .iter()
-            .any(|&(s, at, first)| s >= since && first && at >= after_window);
-        let (probe_start, probe_end) = self.t3_probe_seqs;
-        let latest_probe_acked = self.t3_probe_sent
-            && self
-                .sacked_sends
-                .iter()
-                .any(|&(s, _, _)| s >= probe_start && s < probe_end);
-        if withheld_acked {
-            self.inflight_queue.unmark_all_to_retransmit();
-            self.t3_withheld_since = None;
-            self.t3_retransmit_restarts_timer = false;
-        } else if later_first_acked {
-            self.t3_withheld_since = None;
-            self.t3_retransmit_restarts_timer = true;
-            self.awake_write_loop();
-        } else if latest_probe_acked {
-            let Some(min_rtt) = self.min_rtt() else {
-                return;
-            };
-            // Two milliseconds of tolerance for the millisecond granularity of both sides.
-            if self.t3_probe_sent_at.elapsed().as_millis() as u64 + 2 < min_rtt {
-                return;
-            }
-            self.t3_probes_confirmed += 1;
-            if self.t3_probes_confirmed >= 2 {
-                self.t3_withheld_since = None;
-            } else {
-                self.t3_probe_sent = false;
-            }
-            self.t3_retransmit_restarts_timer = true;
-            self.awake_write_loop();
-        }
-    }
-
     /// Loss detection when nothing waits on cwnd: a chunk is lost once three chunks sent after
     /// its latest transmission, and at least the reordering window after it, have been acked.
     /// That is RFC 6675's DupThresh counted in send order rather than TSN order, so it applies
@@ -1737,7 +1528,6 @@ impl AssociationInternal {
     /// after the chunk - a frame's worth, at 30 frames/s on a 70ms path - and each round of
     /// duplicates the receiver reports widens that by another quarter.
     fn process_fast_retransmission_nocc(&mut self, cum_tsn_ack_point: u32) -> Result<()> {
-        self.resolve_t3_withholding();
         // Reordering this SACK shows: a first transmission acked behind one sent after it. Only
         // first transmissions can tell, since a SACK does not say which transmission of a resent
         // chunk arrived; and chunks acked by one SACK count as arriving together.
@@ -1942,16 +1732,8 @@ impl AssociationInternal {
         if !self.inflight_queue.is_empty() {
             // Start timer. (noop if already started)
             log::trace!("[{}] T3-rtx timer start (pt3)", self.name);
-            // A SACK that drew a retransmission stops the timer first, so that the full RTO
-            // `t3_restart_interval` returns for it actually takes: `start` is a no-op on a
-            // running timer, and the interval already armed can be a millisecond or two.
-            let provisional = self.no_congestion_control && self.t3_retransmit_restarts_timer;
-            let first = self.t3_restart_interval();
             if let Some(t3rtx) = &self.t3rtx {
-                if provisional {
-                    t3rtx.stop().await;
-                }
-                t3rtx.start_after(first, self.rto_mgr.get_rto()).await;
+                t3rtx.start(self.rto_mgr.get_rto()).await;
             }
         } else if state == AssociationState::ShutdownPending {
             // No more outstanding, send shutdown.
@@ -2316,7 +2098,6 @@ impl AssociationInternal {
             c.sent_seq = self.send_seq;
             c.sent_at = Instant::now();
             self.send_seq += 1;
-            self.last_send_at = c.sent_at;
             // RFC 7053: ask for the SACK at once. With no congestion window the RTO floors are
             // sized for a peer that answers within an RTT, not one holding a delayed ack for
             // 200ms; and a SACK per packet is what the loss detection counts. Set on the copy
@@ -2428,28 +2209,6 @@ impl AssociationInternal {
         (chunks, sis_to_reset)
     }
 
-    /// How many packets the chunks marked for retransmission go out in, packed as
-    /// `bundle_data_chunks_into_packets` packs them.
-    fn packets_to_retransmit(&self) -> usize {
-        let mut packets = 0;
-        let mut bytes_in_packet = COMMON_HEADER_SIZE;
-        let mut any = false;
-        let mut tsn = self.cumulative_tsn_ack_point + 1;
-        while let Some(c) = self.inflight_queue.get(tsn) {
-            if c.retransmit && !c.acked && !c.abandoned() {
-                let chunk_size = Self::data_chunk_wire_size(c);
-                if bytes_in_packet + chunk_size > self.mtu {
-                    packets += 1;
-                    bytes_in_packet = COMMON_HEADER_SIZE;
-                }
-                bytes_in_packet += chunk_size;
-                any = true;
-            }
-            tsn += 1;
-        }
-        packets + usize::from(any)
-    }
-
     /// What a DATA chunk adds to a packet: `Packet::marshal` pads every chunk to a 4-byte
     /// boundary, so the bundlers must count that as well as the header, or a bundle of small
     /// chunks lands past the MTU that INITIAL_MTU keeps an IPv6 packet under.
@@ -2559,15 +2318,6 @@ impl AssociationInternal {
         let mut done = false;
         let mut i = 0;
         let nocc = self.no_congestion_control;
-        // RFC 4960 sec 6.3.3 E3 without a congestion window: the timeout resends one packet of
-        // the earliest chunks, and the rest wait, marked, for `resolve_t3_withholding`. With
-        // one, cwnd at one MTU has the same effect.
-        let probe = nocc && self.t3_withheld_since.is_some();
-        if probe && self.t3_probe_sent {
-            return vec![];
-        }
-        let probe_seq_start = self.send_seq;
-        let mut probe_size = COMMON_HEADER_SIZE;
         while !done {
             let tsn = self.cumulative_tsn_ack_point + i + 1;
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
@@ -2581,10 +2331,7 @@ impl AssociationInternal {
                     done = true;
                 } else if bytes_to_send + c.user_data.len() > awnd as usize {
                     break;
-                } else if probe && probe_size + Self::data_chunk_wire_size(c) > self.mtu {
-                    break;
                 }
-                probe_size += Self::data_chunk_wire_size(c);
 
                 // reset the retransmit flag not to retransmit again before the next
                 // t3-rtx timer fires
@@ -2596,7 +2343,6 @@ impl AssociationInternal {
                     c.sent_seq = self.send_seq;
                     c.sent_at = Instant::now();
                     self.send_seq += 1;
-                    self.last_send_at = c.sent_at;
                     c.miss_indicator = 0;
                 }
             } else {
@@ -2619,12 +2365,6 @@ impl AssociationInternal {
             i += 1;
         }
 
-        if probe {
-            self.t3_probe_sent = true;
-            self.t3_probe_sent_at = Instant::now();
-            self.t3_probe_seqs = (probe_seq_start, self.send_seq);
-            self.t3_probe_tsns.extend(chunks.iter().map(|c| c.tsn));
-        }
         self.bundle_data_chunks_into_packets(chunks)
     }
 
@@ -2925,23 +2665,6 @@ impl RtxTimerObserver for AssociationInternal {
                 );
 
                 self.inflight_queue.mark_all_to_retrasmit();
-                // Everything outstanding fits NO_CC_T3_TAIL_PACKETS packets: a short tail,
-                // lost or merely late, goes out at once, and an early timeout costs no more
-                // than those packets. More than that may be a backlog queued behind a stall,
-                // and one packet probes for the rest (`resolve_t3_withholding`).
-                if self.no_congestion_control {
-                    if self.packets_to_retransmit() > NO_CC_T3_TAIL_PACKETS {
-                        self.t3_withheld_since = Some(self.send_seq);
-                        self.t3_at = Instant::now();
-                        self.t3_probe_sent = false;
-                        self.t3_probes_confirmed = 0;
-                        self.t3_probe_tsns.clear();
-                    } else {
-                        // Whatever an earlier timeout withheld is marked afresh and goes out.
-                        self.t3_withheld_since = None;
-                    }
-                    self.t3_retransmit_restarts_timer = false;
-                }
                 self.awake_write_loop();
             }
 

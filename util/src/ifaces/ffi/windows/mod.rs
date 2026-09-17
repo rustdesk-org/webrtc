@@ -324,6 +324,7 @@ unsafe fn map_adapter_addresses(mut adapter_addr: *const IpAdapterAddresses) -> 
 
     while !adapter_addr.is_null() {
         let curr_adapter_addr = &*adapter_addr;
+        let name = adapter_name(curr_adapter_addr);
 
         let mut unicast_addr = curr_adapter_addr.all.first_unicast_address;
         while !unicast_addr.is_null() {
@@ -334,10 +335,10 @@ unsafe fn map_adapter_addresses(mut adapter_addr: *const IpAdapterAddresses) -> 
             if curr_unicast_addr.dad_state != IpDadState::IpDadStateDeprecated {
                 if is_ipv4_enabled(curr_unicast_addr) {
                     adapter_addresses.push(Interface {
-                        name: "".to_string(),
+                        name: name.clone(),
                         kind: Kind::Ipv4,
                         addr: Some(SocketAddr::V4(v4_socket_from_adapter(curr_unicast_addr))),
-                        mask: None,
+                        mask: Some(v4_mask(curr_unicast_addr.on_link_prefix_length)),
                         hop: None,
                     });
                 } else if is_ipv6_enabled(curr_unicast_addr) {
@@ -345,10 +346,10 @@ unsafe fn map_adapter_addresses(mut adapter_addr: *const IpAdapterAddresses) -> 
                     // Make sure the scope id is set for ALL interfaces, not just link-local
                     v6_sock.set_scope_id(curr_adapter_addr.xp.ipv6_if_index);
                     adapter_addresses.push(Interface {
-                        name: "".to_string(),
+                        name: name.clone(),
                         kind: Kind::Ipv6,
                         addr: Some(SocketAddr::V6(v6_sock)),
-                        mask: None,
+                        mask: Some(v6_mask(curr_unicast_addr.on_link_prefix_length)),
                         hop: None,
                     });
                 }
@@ -372,6 +373,77 @@ pub fn ifaces() -> Result<Vec<Interface>, ::std::io::Error> {
         Ok(map_adapter_addresses(
             adapters_list.as_ptr() as *const IpAdapterAddresses
         ))
+    }
+}
+
+/// The adapter's own name, so that `Net` keeps one adapter's addresses apart from another's:
+/// ICE takes one IPv6 address per interface and prefix, and every adapter named "" folded
+/// Ethernet and Wi-Fi on the same LAN into a single choice.
+unsafe fn adapter_name(adapter: &IpAdapterAddresses) -> String {
+    let name = adapter.all.adapter_name;
+    if name.is_null() {
+        return adapter.xp.ipv6_if_index.to_string();
+    }
+    std::ffi::CStr::from_ptr(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The on-link prefix as a netmask, the form `Interface::convert` takes a prefix in.
+fn v4_mask(prefix_len: u8) -> SocketAddr {
+    let bits = match prefix_len.min(32) {
+        0 => 0,
+        n => u32::MAX << (32 - n as u32),
+    };
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(bits), 0))
+}
+
+fn v6_mask(prefix_len: u8) -> SocketAddr {
+    let bits = match prefix_len.min(128) {
+        0 => 0,
+        n => u128::MAX << (128 - n as u32),
+    };
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(bits), 0, 0, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vnet::interface::Interface as VnetInterface;
+    use std::net::IpAddr;
+
+    fn prefix_len(addr: &str, mask: SocketAddr) -> u8 {
+        let addr: SocketAddr = addr.parse().unwrap();
+        VnetInterface::convert(addr, Some(mask))
+            .unwrap()
+            .prefix_len()
+    }
+
+    // The mask is the on-link prefix length written out, and `Interface::convert` reads the
+    // length back off it - both ends of the range included, where the shift would overflow.
+    #[test]
+    fn masks_round_trip_the_prefix_length() {
+        assert_eq!(v6_mask(0).ip(), "::".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            v6_mask(64).ip(),
+            "ffff:ffff:ffff:ffff::".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            v6_mask(127).ip(),
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe"
+                .parse::<IpAddr>()
+                .unwrap()
+        );
+        assert_eq!(v6_mask(128).ip(), Ipv6Addr::from(u128::MAX));
+        assert_eq!(v4_mask(0).ip(), Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(v4_mask(24).ip(), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(v4_mask(32).ip(), Ipv4Addr::new(255, 255, 255, 255));
+        for len in [0u8, 1, 48, 64, 127, 128] {
+            assert_eq!(prefix_len("[2001:db8::1]:0", v6_mask(len)), len);
+        }
+        for len in [0u8, 8, 24, 32] {
+            assert_eq!(prefix_len("192.0.2.1:0", v4_mask(len)), len);
+        }
     }
 }
 

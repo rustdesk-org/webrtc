@@ -102,6 +102,26 @@ pub async fn local_interfaces(
     network_types: &[NetworkType],
     include_loopback: bool,
 ) -> HashSet<IpAddr> {
+    local_interfaces_with(
+        vnet,
+        interface_filter,
+        ip_filter,
+        network_types,
+        include_loopback,
+        ipv6_source_among,
+    )
+    .await
+}
+
+/// `local_interfaces` with the OS's source selection handed in, so a test can stand in for it.
+pub(crate) async fn local_interfaces_with(
+    vnet: &Arc<Net>,
+    interface_filter: &Option<InterfaceFilterFn>,
+    ip_filter: &Option<IpFilterFn>,
+    network_types: &[NetworkType],
+    include_loopback: bool,
+    pick: impl Fn(&[Ipv6Addr]) -> Option<Ipv6Addr>,
+) -> HashSet<IpAddr> {
     let mut ips = HashSet::new();
     let interfaces = vnet.get_interfaces().await;
 
@@ -129,8 +149,7 @@ pub async fn local_interfaces(
             .filter(|ipnet| {
                 let ipaddr = ipnet.addr();
                 (!ipaddr.is_loopback() || include_loopback)
-                    && ((ipv4requested && ipaddr.is_ipv4())
-                        || (ipv6requested && ipaddr.is_ipv6()))
+                    && ((ipv4requested && ipaddr.is_ipv4()) || (ipv6requested && ipaddr.is_ipv6()))
                     && ip_filter
                         .as_ref()
                         .map(|filter| filter(ipaddr))
@@ -140,7 +159,7 @@ pub async fn local_interfaces(
         // Of the IPv6 addresses this interface holds in one prefix, only the one the OS sends
         // from; `ipv6_one_per_prefix` says why. Chosen among the addresses the filters let
         // through, or the one chosen could be one a filter refuses, and its prefix left with none.
-        let ipv6_kept = ipv6_one_per_prefix(&eligible, ipv6_source_among);
+        let ipv6_kept = ipv6_one_per_prefix(&eligible, &pick);
         for ipnet in eligible {
             match ipnet.addr() {
                 IpAddr::V6(v6) if !ipv6_kept.contains(&v6) => {}
@@ -163,8 +182,10 @@ pub async fn local_interfaces(
 /// choice - stands in for that rule, and every other interface and prefix keeps its address.
 /// Grouped only under a known prefix of /64 or shorter: a /127 or /128 is a prefix of its
 /// own, and an enumeration that reports no mask leaves an address at /128, which keeps it
-/// rather than guessing. Link-local is left to the ip_filter. `pick` asks the OS which of a
-/// group it sends from; `None`, or an answer outside the group, keeps the first.
+/// rather than guessing. Link-local is left to the ip_filter. Best effort, not the rule
+/// itself: `pick` asks the OS which address it sends from, and that address is kept alone if
+/// it belongs to the group; if the OS names none of them - source selection resolved through
+/// another interface, or could not be run - the whole group is kept.
 pub(crate) fn ipv6_one_per_prefix(
     addrs: &[IpNet],
     pick: impl Fn(&[Ipv6Addr]) -> Option<Ipv6Addr>,
@@ -185,20 +206,25 @@ pub(crate) fn ipv6_one_per_prefix(
     }
     groups
         .into_values()
-        .filter_map(|members| {
-            if members.len() > 1 {
-                if let Some(chosen) = pick(&members).filter(|c| members.contains(c)) {
-                    return Some(chosen);
-                }
+        .flat_map(|members| {
+            if members.len() < 2 {
+                return members;
             }
-            members.first().copied()
+            // Only the OS's own answer thins a group. When it cannot be asked, or names an address
+            // outside the group - the route to this prefix runs over another interface that shares
+            // it - every address stays, as before: the first listed is on macOS the stable one.
+            match pick(&members).filter(|c| members.contains(c)) {
+                Some(chosen) => vec![chosen],
+                None => members,
+            }
         })
         .collect()
 }
 
-/// Which of `members`, all on one interface in one prefix, the OS sends from. A UDP `connect`
-/// runs source selection and sends nothing; a destination inside the prefix keeps the choice
-/// on that interface, and the OS prefers its temporary address there.
+/// The address the OS sends from towards the prefix of `members`, which are one interface's.
+/// A UDP `connect` runs source selection and sends nothing, and the OS prefers its temporary
+/// address. The probe is bound to no interface: where two share the prefix, the route picks
+/// one of them and the answer for the other is an address it does not hold.
 pub(crate) fn ipv6_source_among(members: &[Ipv6Addr]) -> Option<Ipv6Addr> {
     let first = u128::from(*members.first()?);
     // An address in the prefix that is not one of ours: the first with one identifier bit

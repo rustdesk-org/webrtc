@@ -48,16 +48,41 @@ fn test_ipv6_one_per_prefix_keeps_every_other_prefix() {
     assert_eq!(kept, want.iter().map(|a| v6(a)).collect());
 }
 
-// When the OS cannot be asked, or names an address outside the group, the first stands.
+// When the OS cannot be asked, or names an address outside the group, every address stays:
+// nothing says which one is the temporary one, and the first listed is on macOS the stable one.
 #[test]
-fn test_ipv6_one_per_prefix_falls_back_to_the_first() {
+fn test_ipv6_one_per_prefix_keeps_the_group_it_cannot_choose_from() {
     let addrs = nets(&["2001:db8:1::1/64", "2001:db8:1::2/64"]);
-    let first = HashSet::from([v6("2001:db8:1::1")]);
-    assert_eq!(ipv6_one_per_prefix(&addrs, |_| None), first);
+    let all = HashSet::from([v6("2001:db8:1::1"), v6("2001:db8:1::2")]);
+    assert_eq!(ipv6_one_per_prefix(&addrs, |_| None), all);
     assert_eq!(
         ipv6_one_per_prefix(&addrs, |_| Some(v6("2001:db8:9::9"))),
-        first
+        all
     );
+}
+
+// Ethernet and Wi-Fi on one LAN share a /64, and the route to it runs over one of them: asked
+// about the other, the OS names an address of the first. That interface keeps both of its
+// addresses; the one the route runs over keeps the OS's choice.
+#[tokio::test]
+async fn test_local_interfaces_keeps_an_interface_the_route_bypasses() {
+    let temp_eth = v6("2001:db8:1::e:1");
+    let net = Arc::new(Net::Ifs(vec![
+        util::vnet::interface::Interface::new(
+            "eth0".to_owned(),
+            nets(&["2001:db8:1::e:0/64", "2001:db8:1::e:1/64"]),
+        ),
+        util::vnet::interface::Interface::new(
+            "wlan0".to_owned(),
+            nets(&["2001:db8:1::a:0/64", "2001:db8:1::a:1/64"]),
+        ),
+    ]));
+    let ips = local_interfaces_with(&net, &None, &None, &[NetworkType::Udp6], false, |_| {
+        Some(temp_eth)
+    })
+    .await;
+    let want = [temp_eth, v6("2001:db8:1::a:0"), v6("2001:db8:1::a:1")];
+    assert_eq!(ips, want.iter().map(|a| IpAddr::V6(*a)).collect());
 }
 
 // Link-local addresses are not grouped, so the OS is never asked about them; IPv4 is not
@@ -72,8 +97,8 @@ fn test_ipv6_one_per_prefix_leaves_link_local_and_ipv4_alone() {
 }
 
 // The choice is made among the addresses the filters let through: a filter that refuses the
-// address the OS would pick must leave the prefix its other address, not none. The synthetic
-// prefix has no route, so the pick falls back to the first address, the refused one.
+// address the OS would pick must leave the prefix its other address, not none. What the filter
+// lets through here is a group of one, so the OS is not asked and the address stands.
 #[tokio::test]
 async fn test_local_interfaces_chooses_among_what_the_filter_allows() {
     let allowed = v6("2001:db8:7::2");

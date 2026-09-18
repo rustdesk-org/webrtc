@@ -39,23 +39,14 @@ extern "system" {
     ) -> ULONG;
 }
 
+/// `IP_ADAPTER_ADDRESSES_LH` as the SDK lays it out: flat. Split into one struct per Windows
+/// version, each part ended on its own alignment - the one ending at `oper_status` was padded to
+/// eight bytes on x64 - and everything after it, `ipv6_if_index` first, was read from the wrong
+/// offset.
 #[repr(C)]
 pub struct IpAdapterAddresses {
-    pub head: IpAdapterAddressesHead,
-    pub all: IpAdaptersAddressesAll,
-    pub xp: IpAdaptersAddressesXp,
-    pub vista: IpAdaptersAddressesVista,
-}
-
-#[repr(C)]
-pub struct IpAdapterAddressesHead {
     pub length: ULONG,
     if_index: DWORD,
-}
-
-/// All Windows & Later
-#[repr(C)]
-pub struct IpAdaptersAddressesAll {
     pub next: *const IpAdapterAddresses,
     pub adapter_name: PCHAR,
     pub first_unicast_address: *const IpAdapterUnicastAddress,
@@ -71,19 +62,9 @@ pub struct IpAdaptersAddressesAll {
     mtu: DWORD,
     pub if_type: DWORD,
     oper_status: IfOperStatus,
-}
-
-/// Windows XP & Later
-#[repr(C)]
-pub struct IpAdaptersAddressesXp {
     pub ipv6_if_index: DWORD,
     pub zone_indices: [DWORD; ZONE_INDICES_LENGTH],
     first_prefix: *const IpAdapterPrefix,
-}
-
-/// Windows Vista & Later
-#[repr(C)]
-pub struct IpAdaptersAddressesVista {
     transmit_link_speed: ULONG64,
     receive_link_speed: ULONG64,
     first_wins_server_address: *const IpAdapterWinsServerAddress,
@@ -102,6 +83,25 @@ pub struct IpAdaptersAddressesVista {
     dhcpv6_iaid: ULONG,
     first_dns_suffix: *const IpAdapterDnsSuffix,
 }
+
+// Each field follows the last as the SDK has it, on every target: no part ends on an alignment
+// of its own.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(offset_of!(IpAdapterAddresses, next) == 8);
+    assert!(
+        offset_of!(IpAdapterAddresses, ipv6_if_index)
+            == offset_of!(IpAdapterAddresses, oper_status) + 4
+    );
+    assert!(
+        offset_of!(IpAdapterAddresses, first_prefix)
+            == offset_of!(IpAdapterAddresses, zone_indices) + 4 * ZONE_INDICES_LENGTH
+    );
+    assert!(
+        offset_of!(IpAdapterAddresses, transmit_link_speed)
+            == offset_of!(IpAdapterAddresses, first_prefix) + size_of::<usize>()
+    );
+};
 
 #[repr(C)]
 pub struct IpAdapterUnicastAddress {
@@ -326,7 +326,7 @@ unsafe fn map_adapter_addresses(mut adapter_addr: *const IpAdapterAddresses) -> 
         let curr_adapter_addr = &*adapter_addr;
         let name = adapter_name(curr_adapter_addr);
 
-        let mut unicast_addr = curr_adapter_addr.all.first_unicast_address;
+        let mut unicast_addr = curr_adapter_addr.first_unicast_address;
         while !unicast_addr.is_null() {
             let curr_unicast_addr = &*unicast_addr;
 
@@ -344,7 +344,7 @@ unsafe fn map_adapter_addresses(mut adapter_addr: *const IpAdapterAddresses) -> 
                 } else if is_ipv6_enabled(curr_unicast_addr) {
                     let mut v6_sock = v6_socket_from_adapter(curr_unicast_addr);
                     // Make sure the scope id is set for ALL interfaces, not just link-local
-                    v6_sock.set_scope_id(curr_adapter_addr.xp.ipv6_if_index);
+                    v6_sock.set_scope_id(curr_adapter_addr.ipv6_if_index);
                     adapter_addresses.push(Interface {
                         name: name.clone(),
                         kind: Kind::Ipv6,
@@ -358,7 +358,7 @@ unsafe fn map_adapter_addresses(mut adapter_addr: *const IpAdapterAddresses) -> 
             unicast_addr = curr_unicast_addr.next;
         }
 
-        adapter_addr = curr_adapter_addr.all.next;
+        adapter_addr = curr_adapter_addr.next;
     }
 
     adapter_addresses
@@ -380,9 +380,9 @@ pub fn ifaces() -> Result<Vec<Interface>, ::std::io::Error> {
 /// ICE takes one IPv6 address per interface and prefix, and every adapter named "" folded
 /// Ethernet and Wi-Fi on the same LAN into a single choice.
 unsafe fn adapter_name(adapter: &IpAdapterAddresses) -> String {
-    let name = adapter.all.adapter_name;
+    let name = adapter.adapter_name;
     if name.is_null() {
-        return adapter.xp.ipv6_if_index.to_string();
+        return adapter.ipv6_if_index.to_string();
     }
     std::ffi::CStr::from_ptr(name)
         .to_string_lossy()

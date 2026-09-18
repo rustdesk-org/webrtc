@@ -156,9 +156,9 @@ pub(crate) async fn local_interfaces_with(
                         .unwrap_or(true)
             })
             .collect();
-        // Of the IPv6 addresses this interface holds in one prefix, only the one the OS sends
-        // from; `ipv6_one_per_prefix` says why. Chosen among the addresses the filters let
-        // through, or the one chosen could be one a filter refuses, and its prefix left with none.
+        // Of an interface's IPv6 addresses in one prefix, the one the OS sends from if that is one
+        // of them, else all; `ipv6_one_per_prefix` says why. Asked among what the filters let
+        // through: named an address a filter refuses, the group would thin to it and lose it.
         let ipv6_kept = ipv6_one_per_prefix(&eligible, &pick);
         for ipnet in eligible {
             match ipnet.addr() {
@@ -173,19 +173,19 @@ pub(crate) async fn local_interfaces_with(
     ips
 }
 
-/// Of the IPv6 addresses one interface holds in one prefix, the one the OS sends from. Beside
-/// the temporary address that privacy extensions rotate, a prefix usually carries a stable one
-/// the OS never picks as a source; a host candidate for it hands the peer an identifier that
-/// outlives every rotation and that nothing else this machine sends out ever shows. RFC 8445
-/// §5.1.1.1 has the trackable addresses of an interface and prefix left out once a privacy
-/// one is gathered; with no portable way to tell the two apart, one per prefix - the OS's own
-/// choice - stands in for that rule, and every other interface and prefix keeps its address.
-/// Grouped only under a known prefix of /64 or shorter: a /127 or /128 is a prefix of its
-/// own, and an enumeration that reports no mask leaves an address at /128, which keeps it
-/// rather than guessing. Link-local is left to the ip_filter. Best effort, not the rule
+/// Of the IPv6 addresses one interface holds in one prefix, the one the OS sends from - or
+/// all of them, when that cannot be told. Beside the temporary address that privacy extensions
+/// rotate, a prefix usually carries a stable one the OS never picks as a source; a host
+/// candidate for it hands the peer an identifier that outlives every rotation and that nothing
+/// else this machine sends out ever shows. RFC 8445 §5.1.1.1 has the trackable addresses of an
+/// interface and prefix left out once a privacy one is gathered; with no portable way to tell
+/// the two apart, the OS's own choice stands in for that rule, best effort and not the rule
 /// itself: `pick` asks the OS which address it sends from, and that address is kept alone if
 /// it belongs to the group; if the OS names none of them - source selection resolved through
-/// another interface, or could not be run - the whole group is kept.
+/// another interface, or could not be run - the whole group is kept. Every other interface and
+/// prefix keeps its address. Grouped only under a known prefix of /64 or shorter: a /127 or
+/// /128 is a prefix of its own, and an enumeration that reports no mask leaves an address at
+/// /128, which keeps it rather than guessing. Link-local is left to the ip_filter.
 pub(crate) fn ipv6_one_per_prefix(
     addrs: &[IpNet],
     pick: impl Fn(&[Ipv6Addr]) -> Option<Ipv6Addr>,
@@ -222,9 +222,10 @@ pub(crate) fn ipv6_one_per_prefix(
 }
 
 /// The address the OS sends from towards the prefix of `members`, which are one interface's.
-/// A UDP `connect` runs source selection and sends nothing, and the OS prefers its temporary
-/// address. The probe is bound to no interface: where two share the prefix, the route picks
-/// one of them and the answer for the other is an address it does not hold.
+/// A UDP `connect` runs the OS's own source address selection and sends nothing; with privacy
+/// extensions on that is normally the temporary address, but the policy is the OS's to set.
+/// The probe is bound to no interface: where two share the prefix, the route picks one of
+/// them and the answer for the other is an address it does not hold.
 pub(crate) fn ipv6_source_among(members: &[Ipv6Addr]) -> Option<Ipv6Addr> {
     let first = u128::from(*members.first()?);
     // An address in the prefix that is not one of ours: the first with one identifier bit

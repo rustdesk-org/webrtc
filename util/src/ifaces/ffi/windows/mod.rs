@@ -85,22 +85,24 @@ pub struct IpAdapterAddresses {
 }
 
 // Each field follows the last as the SDK has it, on every target: no part ends on an alignment
-// of its own.
+// of its own. Checked as the crate builds, with what a const allows on Rust 1.75.
 const _: () = {
-    use std::mem::{offset_of, size_of};
-    assert!(offset_of!(IpAdapterAddresses, next) == 8);
-    assert!(
-        offset_of!(IpAdapterAddresses, ipv6_if_index)
-            == offset_of!(IpAdapterAddresses, oper_status) + 4
-    );
-    assert!(
-        offset_of!(IpAdapterAddresses, first_prefix)
-            == offset_of!(IpAdapterAddresses, zone_indices) + 4 * ZONE_INDICES_LENGTH
-    );
-    assert!(
-        offset_of!(IpAdapterAddresses, transmit_link_speed)
-            == offset_of!(IpAdapterAddresses, first_prefix) + size_of::<usize>()
-    );
+    macro_rules! offset {
+        ($field:ident) => {{
+            let u = std::mem::MaybeUninit::<IpAdapterAddresses>::uninit();
+            let p = u.as_ptr();
+            // SAFETY: the address of a field inside the allocation, and nothing is read.
+            unsafe {
+                std::ptr::addr_of!((*p).$field)
+                    .cast::<u8>()
+                    .offset_from(p.cast::<u8>()) as usize
+            }
+        }};
+    }
+    assert!(offset!(next) == 8);
+    assert!(offset!(ipv6_if_index) == offset!(oper_status) + 4);
+    assert!(offset!(first_prefix) == offset!(zone_indices) + 4 * ZONE_INDICES_LENGTH);
+    assert!(offset!(transmit_link_speed) == offset!(first_prefix) + std::mem::size_of::<usize>());
 };
 
 #[repr(C)]

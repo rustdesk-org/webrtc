@@ -1005,6 +1005,12 @@ impl AssociationInternal {
         self.stats.inc_datas();
 
         let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
+        // A TSN already queued, or already behind the cumulative point, is a duplicate: the next
+        // SACK lists it, and goes at once (RFC 9260 §6.2) - the sender reads a duplicate as a
+        // resend the path did not need. `push` would list it, but is reached for new TSNs only.
+        if !can_push {
+            self.payload_queue.dup_tsn.push(d.tsn);
+        }
         let mut stream_handle_data = false;
         if can_push {
             if let Some(_s) = self.get_or_create_stream(d.stream_identifier) {
@@ -1045,7 +1051,7 @@ impl AssociationInternal {
             }
         }
 
-        self.handle_peer_last_tsn_and_acknowledgement(immediate_sack)
+        self.handle_peer_last_tsn_and_acknowledgement(immediate_sack || !can_push)
     }
 
     /// A common routine for handle_data and handle_forward_tsn routines
@@ -2383,11 +2389,24 @@ impl AssociationInternal {
     }
 
     async fn create_selective_ack_chunk(&mut self) -> ChunkSelectiveAck {
+        // Gap blocks and duplicates are four bytes each, and a receive queue full of holes holds
+        // more than an MTU of them. The lowest blocks that fit go (RFC 9260 §6.7), the rest in a
+        // later SACK once the holes below them fill; then the duplicates that fit, the others
+        // being no more than a hint.
+        let room = (self.mtu as usize).saturating_sub(
+            COMMON_HEADER_SIZE as usize
+                + crate::chunk::chunk_header::CHUNK_HEADER_SIZE
+                + crate::chunk::chunk_selective_ack::SELECTIVE_ACK_HEADER_SIZE,
+        ) / 4;
+        let mut gap_ack_blocks = self.payload_queue.get_gap_ack_blocks(self.peer_last_tsn);
+        gap_ack_blocks.truncate(room);
+        let mut duplicate_tsn = self.payload_queue.pop_duplicates();
+        duplicate_tsn.truncate(room - gap_ack_blocks.len());
         ChunkSelectiveAck {
             cumulative_tsn_ack: self.peer_last_tsn,
             advertised_receiver_window_credit: self.get_my_receiver_window_credit().await,
-            gap_ack_blocks: self.payload_queue.get_gap_ack_blocks(self.peer_last_tsn),
-            duplicate_tsn: self.payload_queue.pop_duplicates(),
+            gap_ack_blocks,
+            duplicate_tsn,
         }
     }
 

@@ -755,7 +755,16 @@ async fn sack_with_dups(
             .collect(),
         duplicate_tsn: dups.to_vec(),
     };
-    let (_, htna) = a.process_selective_ack(&d).await?;
+    sack_chunk(a, &d).await
+}
+
+/// Runs a SACK chunk through the acking and loss-detection steps of handle_sack.
+async fn sack_chunk(
+    a: &mut AssociationInternal,
+    d: &ChunkSelectiveAck,
+) -> crate::error::Result<()> {
+    let cum = d.cumulative_tsn_ack;
+    let (_, htna) = a.process_selective_ack(d).await?;
     let advanced = sna32lt(a.cumulative_tsn_ack_point, cum);
     a.cumulative_tsn_ack_point = cum;
     a.process_fast_retransmission(cum, htna, advanced)
@@ -1078,5 +1087,159 @@ fn test_bundled_data_chunks_stay_within_mtu() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// A DATA chunk for `tsn`: one message of its own on stream 1.
+fn data_chunk(tsn: u32) -> ChunkPayloadData {
+    ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        stream_identifier: 1,
+        stream_sequence_number: tsn as u16,
+        user_data: Bytes::from(vec![0u8; 10]),
+        ..Default::default()
+    }
+}
+
+/// An association that can take DATA: with a receive window, and with stream 1 open - a stream
+/// a chunk would create needs the accept channel's receiver, which the constructor drops.
+fn create_receiving_association_internal() -> AssociationInternal {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 1024 * 1024,
+        max_message_size: 0,
+        name: "server".to_owned(),
+    });
+    a.open_stream(
+        1,
+        crate::chunk::chunk_payload_data::PayloadProtocolIdentifier::Binary,
+    )
+    .expect("stream 1 opens on a fresh association");
+    a
+}
+
+// A DATA chunk received again - behind the cumulative point, or queued behind a gap - is listed
+// in the next SACK's duplicates, and that SACK goes at once: the sender reads a duplicate as a
+// resend the path did not need. The SACK empties the list.
+#[tokio::test]
+async fn test_handle_data_lists_duplicates_and_sacks_them_at_once() -> Result<()> {
+    let mut a = create_receiving_association_internal();
+    a.peer_last_tsn = 100;
+
+    a.handle_chunk_start();
+    a.handle_data(&data_chunk(100)).await?;
+    assert_eq!(
+        a.payload_queue.dup_tsn,
+        vec![100],
+        "behind the cumulative point"
+    );
+    assert!(
+        a.immediate_ack_triggered,
+        "a duplicate alone asks for the SACK at once"
+    );
+
+    a.handle_chunk_start();
+    a.handle_data(&data_chunk(102)).await?;
+    assert_eq!(a.payload_queue.dup_tsn, vec![100], "new, waiting on 101");
+
+    a.handle_chunk_start();
+    a.handle_data(&data_chunk(102)).await?;
+    assert_eq!(
+        a.payload_queue.dup_tsn,
+        vec![100, 102],
+        "queued behind a gap, received again"
+    );
+    assert!(a.immediate_ack_triggered);
+
+    let sack = a.create_selective_ack_chunk().await;
+    assert_eq!(sack.duplicate_tsn, vec![100, 102]);
+    assert!(a.payload_queue.dup_tsn.is_empty(), "listed once");
+    Ok(())
+}
+
+// The receiver's own SACK, not one written by hand, carries the duplicate that widens the
+// sender's reordering window: both ends of the feedback the window depends on.
+#[tokio::test]
+async fn test_assoc_no_congestion_control_widens_the_window_on_the_receivers_sack() -> Result<()> {
+    let mut sender = create_client_association_internal();
+    sender.no_congestion_control = true;
+    sender.rto_mgr.srtt = 40;
+    sender.rto_mgr.no_update = true;
+    inflight_10_to_16(&mut sender);
+    sack(&mut sender, 9, &[(4, 4)]).await?;
+    sack(&mut sender, 9, &[(2, 2), (4, 4)]).await?;
+    assert_eq!(
+        sender.reo_wnd,
+        Duration::from_millis(10),
+        "reordering seen: a quarter of srtt"
+    );
+
+    let mut receiver = create_receiving_association_internal();
+    receiver.peer_last_tsn = 9;
+    for tsn in [11, 13, 14, 11] {
+        receiver.handle_chunk_start();
+        receiver.handle_data(&data_chunk(tsn)).await?;
+    }
+    let d = receiver.create_selective_ack_chunk().await;
+    assert_eq!(d.duplicate_tsn, vec![11]);
+    sack_chunk(&mut sender, &d).await?;
+    assert_eq!(
+        sender.reo_wnd,
+        Duration::from_millis(20),
+        "the receiver's duplicate: one quarter more"
+    );
+    Ok(())
+}
+
+// A receive queue with more holes than an MTU of gap blocks: the SACK keeps to the MTU, reports
+// the lowest blocks, and lists after them the duplicates that fit.
+#[tokio::test]
+async fn test_selective_ack_stays_within_mtu() -> Result<()> {
+    let mut a = create_receiving_association_internal();
+    let room = (a.mtu as usize
+        - COMMON_HEADER_SIZE as usize
+        - crate::chunk::chunk_header::CHUNK_HEADER_SIZE
+        - crate::chunk::chunk_selective_ack::SELECTIVE_ACK_HEADER_SIZE)
+        / 4;
+    a.peer_last_tsn = 0;
+    for tsn in (2..=2 * (room as u32 + 100)).step_by(2) {
+        a.payload_queue.push_no_check(data_chunk(tsn));
+    }
+    a.payload_queue.dup_tsn = (1..=50).collect();
+    let sack = a.create_selective_ack_chunk().await;
+    let raw = sack.marshal()?;
+    assert!(
+        raw.len() as u32 + COMMON_HEADER_SIZE <= a.mtu,
+        "SACK of {} bytes exceeds the MTU of {}",
+        raw.len() as u32 + COMMON_HEADER_SIZE,
+        a.mtu
+    );
+    assert_eq!(sack.gap_ack_blocks.len(), room, "as many blocks as fit");
+    assert_eq!(
+        (sack.gap_ack_blocks[0].start, sack.gap_ack_blocks[0].end),
+        (2, 2),
+        "the lowest first"
+    );
+    assert_eq!(
+        sack.gap_ack_blocks[room - 1].start,
+        2 * room as u16,
+        "in order up to the last that fits"
+    );
+    assert!(sack.duplicate_tsn.is_empty(), "no room left for duplicates");
+
+    // Fewer holes: the duplicates take what is left.
+    let mut a = create_receiving_association_internal();
+    a.peer_last_tsn = 0;
+    for tsn in (2..=20).step_by(2) {
+        a.payload_queue.push_no_check(data_chunk(tsn));
+    }
+    a.payload_queue.dup_tsn = (1..=2 * room as u32).collect();
+    let sack = a.create_selective_ack_chunk().await;
+    let raw = sack.marshal()?;
+    assert!(raw.len() as u32 + COMMON_HEADER_SIZE <= a.mtu);
+    assert_eq!(sack.gap_ack_blocks.len(), 10);
+    assert_eq!(sack.duplicate_tsn.len(), room - 10);
     Ok(())
 }
